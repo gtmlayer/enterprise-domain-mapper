@@ -14,21 +14,21 @@ This tool fixes that.
 $ domain-mapper "HSBC"
 
 HSBC
-├── HSBC Services        hsbcservices.com  [SEC EDGAR]
-├── HSBC Business Solutions  hsbc-solutions.com  [Wikipedia]
-├── First Direct            dimensiondata.com    [Wikipedia]
-├── HSBC Italia           hsbc.it           [TLD guess ✓ DNS verified]
-├── HSBC UK               hsbc.co.uk        [TLD guess ✓ DNS verified]
-└── HSBC Japan            hsbc.co.jp        [TLD guess ✓ DNS verified]
+├── HSBC Bank USA             us.hsbc.com       [SEC EDGAR]
+├── First Direct              firstdirect.com   [Wikipedia]
+├── HSBC Continental Europe   hsbc.fr           [Wikipedia]
+├── HSBC UK                   hsbc.co.uk        [TLD guess ✓ DNS verified]
+├── HSBC Italy                hsbc.it           [TLD guess ✓ DNS verified]
+└── HSBC Hong Kong            hsbc.com.hk       [TLD guess ✓ DNS verified]
 
 Found 12 subsidiaries, 18 domains (6 confirmed, 12 guessed, 9 DNS verified)
 ```
 
 ## The problem
 
-Enterprise accounts don't operate under a single domain. A company like HSBC has subsidiaries in 50+ countries, each with localised domains. Deloitte has member firms. Boeing has defence subsidiaries that use completely different brands.
+Enterprise accounts don't operate under a single domain. A company like HSBC runs distinctly branded subsidiaries such as First Direct alongside regional banks in dozens of countries, each with its own domain. Deloitte has member firms. Nestlé sits over hundreds of consumer brands that use completely different domains.
 
-If you're running enrichment against just `hsbc.com`, you're finding maybe 30% of the contacts you could be reaching. The rest are hiding behind `dimensiondata.com`, `hsbc.co.uk`, `hsbc.it`, and domains you didn't know existed.
+If you're running enrichment against just `hsbc.com`, you're finding maybe 30% of the contacts you could be reaching. The rest are hiding behind `firstdirect.com`, `hsbc.co.uk`, `hsbc.com.hk`, and domains you didn't know existed.
 
 Building these domain maps manually takes hours per account. We built this tool because we got tired of doing it by hand.
 
