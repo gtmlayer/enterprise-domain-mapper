@@ -49,24 +49,23 @@ def _print_tree(result: CompanyResult) -> None:
         source_tag = f"[dim][{domain.domain_source}][/dim]"
 
         if domain.dns_verified:
-            source_tag += " [green]✓ DNS verified[/green]"
+            source_tag += " [green]✓ MX verified[/green]"
+        elif domain.dns_status == "a-only":
+            source_tag += " [yellow]resolves (no MX)[/yellow]"
 
         tree.add(
-            f"{icon} [cyan]{domain.subsidiary_name:<30}[/cyan] "
-            f"{domain.domain:<25} {source_tag}"
+            f"{icon} [cyan]{domain.subsidiary_name:<30}[/cyan] " f"{domain.domain:<25} {source_tag}"
         )
 
     console.print(tree)
 
     # Summary line
     total = len(result.domains)
-    confirmed = len(result.confirmed_domains)
     guessed = len(result.guessed_domains)
     verified = len(result.verified_domains)
     console.print(
         f"\n[dim]Found {len(result.subsidiaries)} subsidiaries, "
-        f"{total} domains ({confirmed} confirmed, {guessed} guessed, "
-        f"{verified} DNS verified)[/dim]"
+        f"{total} domains ({guessed} guessed, {verified} MX verified)[/dim]"
     )
 
 
@@ -93,11 +92,25 @@ def main(input: str, output: str | None, output_format: str, verify_dns: bool, v
     else:
         logging.basicConfig(level=logging.WARNING)
 
+    # Guard the input before doing any work: reject empty/whitespace, and a
+    # .csv path that does not exist (rather than silently treating it as a
+    # company name to look up).
+    input = (input or "").strip()
+    if not input:
+        console.print(
+            "[red]Error: no input provided. Pass a company name or a CSV file path.[/red]"
+        )
+        sys.exit(1)
+
+    input_path = Path(input)
+    if input_path.suffix.lower() == ".csv" and not input_path.is_file():
+        console.print(f"[red]Error: CSV file not found: {input}[/red]")
+        sys.exit(1)
+
     mapper = DomainMapper(verify_dns=verify_dns)
     results: list[CompanyResult] = []
 
-    input_path = Path(input)
-    if input_path.exists() and input_path.suffix.lower() == ".csv":
+    if input_path.suffix.lower() == ".csv":
         # Batch mode: CSV input
         results = _process_csv(mapper, input_path, verify_dns)
     else:
@@ -108,7 +121,9 @@ def main(input: str, output: str | None, output_format: str, verify_dns: bool, v
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
-            task = progress.add_task("Searching SEC EDGAR, Wikipedia, generating TLDs...", total=None)
+            task = progress.add_task(
+                "Searching SEC EDGAR, Wikipedia, generating TLDs...", total=None
+            )
             result = mapper.map_company(input)
             progress.update(task, completed=True)
 
@@ -150,7 +165,9 @@ def _process_csv(mapper: DomainMapper, csv_path: Path, verify_dns: bool) -> list
 
     console.print(f"\n[bold]Processing {len(rows)} companies from {csv_path.name}[/bold]")
     if domain_col:
-        console.print(f"[dim]Using '{company_col}' for names, '{domain_col}' for parent domains[/dim]")
+        console.print(
+            f"[dim]Using '{company_col}' for names, '{domain_col}' for parent domains[/dim]"
+        )
     else:
         console.print(f"[dim]Using '{company_col}' for names (no domain column detected)[/dim]")
 
@@ -166,19 +183,21 @@ def _process_csv(mapper: DomainMapper, csv_path: Path, verify_dns: bool) -> list
             if not company_name:
                 continue
 
-            task = progress.add_task(
-                f"[{i + 1}/{len(rows)}] {company_name}...", total=None
-            )
+            task = progress.add_task(f"[{i + 1}/{len(rows)}] {company_name}...", total=None)
             result = mapper.map_company(company_name, parent_domain)
             results.append(result)
-            progress.update(task, completed=True, description=f"[{i + 1}/{len(rows)}] {company_name}: {len(result.domains)} domains")
+            progress.update(
+                task,
+                completed=True,
+                description=f"[{i + 1}/{len(rows)}] {company_name}: {len(result.domains)} domains",
+            )
 
     # Print summary
     total_subs = sum(len(r.subsidiaries) for r in results)
     total_domains = sum(len(r.domains) for r in results)
     total_verified = sum(len(r.verified_domains) for r in results)
 
-    console.print(f"\n[bold]Summary[/bold]")
+    console.print("\n[bold]Summary[/bold]")
     console.print(f"  Companies processed: {len(results)}")
     console.print(f"  Total subsidiaries found: {total_subs}")
     console.print(f"  Total domains mapped: {total_domains}")

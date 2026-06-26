@@ -3,7 +3,7 @@
 import logging
 
 from domain_mapper.dns_verifier import DnsVerifier
-from domain_mapper.models import Confidence, CompanyResult, DomainResult, DomainSource
+from domain_mapper.models import CompanyResult, Confidence, DomainResult, DomainSource
 from domain_mapper.sources.sec_edgar import SecEdgarSource
 from domain_mapper.sources.tld_generator import TldGenerator
 from domain_mapper.sources.wikipedia import WikipediaSource
@@ -53,7 +53,7 @@ class DomainMapper:
                 unique_subs.append(sub)
         result.subsidiaries = unique_subs
 
-        # 2. Create confirmed domain results from SEC/Wikipedia subsidiaries
+        # 2. Guess a .com directly from each SEC/Wikipedia subsidiary name
         for sub in result.subsidiaries:
             # If the subsidiary name looks like it could be a domain, add it directly
             domain = self._guess_direct_domain(sub.name, parent_domain)
@@ -63,11 +63,21 @@ class DomainMapper:
                         parent_company=company_name,
                         parent_domain=parent_domain,
                         subsidiary_name=sub.name,
-                        subsidiary_type=sub.subsidiary_type.value if hasattr(sub.subsidiary_type, 'value') else str(sub.subsidiary_type),
+                        subsidiary_type=(
+                            sub.subsidiary_type.value
+                            if hasattr(sub.subsidiary_type, "value")
+                            else str(sub.subsidiary_type)
+                        ),
                         jurisdiction=sub.jurisdiction,
                         domain=domain,
-                        domain_source=sub.source.value if hasattr(sub.source, 'value') else str(sub.source),
-                        confidence=Confidence.HIGH.value,
+                        # The entity came from SEC/Wikipedia, but this .com is a guess
+                        # from its name, so the source is NAME_GUESS, not the filing.
+                        domain_source=DomainSource.NAME_GUESS.value,
+                        # A .com guessed from the entity name is unverified, so it
+                        # must NOT be HIGH. It starts MEDIUM (a brand-name guess is
+                        # a reasonable signal) and is only promoted to HIGH if DNS
+                        # MX verification confirms live mail.
+                        confidence=Confidence.MEDIUM.value,
                     )
                 )
 

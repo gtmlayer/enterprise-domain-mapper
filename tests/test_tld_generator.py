@@ -1,7 +1,20 @@
 """Tests for TLD pattern generation."""
 
 from domain_mapper.models import DomainSource, Subsidiary, SubsidiaryType
-from domain_mapper.sources.tld_generator import TldGenerator, _normalise_jurisdiction
+from domain_mapper.sources.tld_generator import (
+    TldGenerator,
+    _normalise_jurisdiction,
+    detect_country,
+)
+
+
+def test_detect_country():
+    assert detect_country("Acme Europe Italy") == "italy"
+    assert detect_country("Subsidiary in the United Kingdom") == "united kingdom"
+    assert detect_country("South Korea office") == "south korea"
+    assert detect_country("no country mentioned here") == ""
+    # Word boundaries: 'uk' inside 'ukraine' must not match as the UK.
+    assert detect_country("ukraine operations") == "ukraine"
 
 
 def test_normalise_jurisdiction():

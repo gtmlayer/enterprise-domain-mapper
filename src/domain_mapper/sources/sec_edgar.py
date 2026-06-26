@@ -25,6 +25,30 @@ HEADERS = {
 # Rate limit: SEC EDGAR asks for max 10 requests/second
 _last_request_time = 0.0
 
+# Corporate suffixes stripped before matching a company name to an EDGAR title.
+_CORP_SUFFIXES = {
+    "inc",
+    "incorporated",
+    "corp",
+    "corporation",
+    "co",
+    "company",
+    "ltd",
+    "limited",
+    "plc",
+    "llc",
+    "lp",
+    "llp",
+    "holdings",
+    "holding",
+    "group",
+    "the",
+    "sa",
+    "ag",
+    "nv",
+    "se",
+}
+
 
 def _rate_limit():
     """Enforce SEC EDGAR rate limits."""
@@ -33,6 +57,54 @@ def _rate_limit():
     if elapsed < 0.15:
         time.sleep(0.15 - elapsed)
     _last_request_time = time.time()
+
+
+def _normalise_company(name: str) -> str:
+    """Lowercase, strip punctuation and common corporate suffixes for matching."""
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", name.lower())
+    words = [w for w in cleaned.split() if w and w not in _CORP_SUFFIXES]
+    return " ".join(words)
+
+
+def _match_cik_from_tickers(tickers: dict, company_name: str) -> str | None:
+    """Find the best-matching CIK for a company name in the company_tickers.json payload.
+
+    Pure function (no network) so it can be unit-tested with a fixture. Ranks
+    candidates: exact normalised match > prefix match > substring match, breaking
+    ties by the shortest title (closest match). Returns a zero-padded 10-digit CIK.
+    """
+    query = _normalise_company(company_name)
+    if not query:
+        return None
+
+    best_cik: str | None = None
+    best_score = 0
+    best_len = 10**9
+
+    for entry in tickers.values():
+        title = entry.get("title", "")
+        cik_str = entry.get("cik_str")
+        if cik_str is None or not title:
+            continue
+        norm_title = _normalise_company(title)
+        if not norm_title:
+            continue
+
+        if norm_title == query:
+            score = 3
+        elif norm_title.startswith(query) or query.startswith(norm_title):
+            score = 2
+        elif query in norm_title or norm_title in query:
+            score = 1
+        else:
+            continue
+
+        if score > best_score or (score == best_score and len(norm_title) < best_len):
+            best_score = score
+            best_len = len(norm_title)
+            best_cik = str(cik_str).zfill(10)
+
+    return best_cik
 
 
 class SecEdgarSource:
@@ -63,23 +135,13 @@ class SecEdgarSource:
             return []
 
     def _find_cik(self, company_name: str) -> str | None:
-        """Find the CIK number for a company."""
-        _rate_limit()
-        url = "https://efts.sec.gov/LATEST/search-index"
-        params = {"q": f'"{company_name}"', "forms": "10-K", "dateRange": "custom", "startdt": "2020-01-01"}
-        try:
-            resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            hits = data.get("hits", {}).get("hits", [])
-            if hits:
-                cik = hits[0].get("_source", {}).get("entity_id", "")
-                if cik:
-                    return str(cik).zfill(10)
-        except Exception:
-            pass
+        """Find the CIK number for a company.
 
-        # Fallback: try the company tickers JSON
+        Primary source is the official company_tickers.json registry (stable,
+        documented), matched with ranked normalisation. The EDGAR full-text
+        search is a secondary fallback.
+        """
+        # Primary: company_tickers.json (the reliable registry)
         _rate_limit()
         try:
             resp = requests.get(
@@ -88,11 +150,25 @@ class SecEdgarSource:
                 timeout=15,
             )
             resp.raise_for_status()
-            tickers = resp.json()
-            name_lower = company_name.lower()
-            for entry in tickers.values():
-                if name_lower in entry.get("title", "").lower():
-                    return str(entry["cik_str"]).zfill(10)
+            cik = _match_cik_from_tickers(resp.json(), company_name)
+            if cik:
+                return cik
+        except Exception:
+            pass
+
+        # Fallback: EDGAR full-text search. The CIK lives in _source.ciks
+        # (a list of zero-padded CIK strings), NOT in an "entity_id" field.
+        _rate_limit()
+        url = "https://efts.sec.gov/LATEST/search-index"
+        params = {"q": f'"{company_name}"', "forms": "10-K"}
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+            hits = resp.json().get("hits", {}).get("hits", [])
+            if hits:
+                ciks = hits[0].get("_source", {}).get("ciks", [])
+                if ciks:
+                    return str(ciks[0]).zfill(10)
         except Exception:
             pass
 
@@ -180,11 +256,20 @@ class SecEdgarSource:
                     continue
 
                 # Skip headers and boilerplate
-                if any(skip in line.lower() for skip in [
-                    "exhibit", "subsidiaries", "registrant",
-                    "name of subsidiary", "jurisdiction", "state or",
-                    "incorporated", "page", "form 10-k",
-                ]):
+                if any(
+                    skip in line.lower()
+                    for skip in [
+                        "exhibit",
+                        "subsidiaries",
+                        "registrant",
+                        "name of subsidiary",
+                        "jurisdiction",
+                        "state or",
+                        "incorporated",
+                        "page",
+                        "form 10-k",
+                    ]
+                ):
                     continue
 
                 # Try to split into name and jurisdiction

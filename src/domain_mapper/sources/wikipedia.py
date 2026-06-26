@@ -7,6 +7,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from domain_mapper.models import DomainSource, Subsidiary, SubsidiaryType
+from domain_mapper.sources.tld_generator import detect_country
 
 logger = logging.getLogger(__name__)
 
@@ -94,10 +95,15 @@ class WikipediaSource:
                         for item in self._extract_list_items(data):
                             if item not in seen_names:
                                 seen_names.add(item)
-                                sub_type = SubsidiaryType.DIVISION if "division" in header_text else SubsidiaryType.SUBSIDIARY
+                                sub_type = (
+                                    SubsidiaryType.DIVISION
+                                    if "division" in header_text
+                                    else SubsidiaryType.SUBSIDIARY
+                                )
                                 subsidiaries.append(
                                     Subsidiary(
                                         name=item,
+                                        jurisdiction=detect_country(item),
                                         subsidiary_type=sub_type,
                                         source=DomainSource.WIKIPEDIA,
                                     )
@@ -106,10 +112,27 @@ class WikipediaSource:
         # 2. Look for sections about subsidiaries/acquisitions
         for heading in soup.find_all(["h2", "h3", "h4"]):
             heading_text = heading.get_text(strip=True).lower()
-            if any(k in heading_text for k in [
-                "subsidiar", "acquisition", "merger", "division",
-                "brand", "affiliate", "member firm",
-            ]):
+            if any(
+                k in heading_text
+                for k in [
+                    "subsidiar",
+                    "acquisition",
+                    "merger",
+                    "division",
+                    "brand",
+                    "affiliate",
+                    "member firm",
+                ]
+            ):
+                # The relationship type is decided by the heading, not hardcoded:
+                # only acquisition/merger sections are acquisitions, everything
+                # else defaults to a neutral subsidiary.
+                sub_type = (
+                    SubsidiaryType.ACQUISITION
+                    if "acqui" in heading_text or "merger" in heading_text
+                    else SubsidiaryType.SUBSIDIARY
+                )
+
                 # Collect content until the next heading
                 content_elements = []
                 sibling = heading.find_next_sibling()
@@ -124,14 +147,10 @@ class WikipediaSource:
                             name = self._clean_entity_name(li)
                             if name and name not in seen_names and len(name) > 2:
                                 seen_names.add(name)
-                                sub_type = (
-                                    SubsidiaryType.ACQUISITION
-                                    if "acqui" in heading_text or "merger" in heading_text
-                                    else SubsidiaryType.SUBSIDIARY
-                                )
                                 subsidiaries.append(
                                     Subsidiary(
                                         name=name,
+                                        jurisdiction=detect_country(li.get_text(" ", strip=True)),
                                         subsidiary_type=sub_type,
                                         source=DomainSource.WIKIPEDIA,
                                     )
@@ -145,10 +164,12 @@ class WikipediaSource:
                                 name = self._clean_entity_name(cells[0])
                                 if name and name not in seen_names and len(name) > 2:
                                     seen_names.add(name)
+                                    row_text = " ".join(c.get_text(" ", strip=True) for c in cells)
                                     subsidiaries.append(
                                         Subsidiary(
                                             name=name,
-                                            subsidiary_type=SubsidiaryType.ACQUISITION,
+                                            jurisdiction=detect_country(row_text),
+                                            subsidiary_type=sub_type,
                                             source=DomainSource.WIKIPEDIA,
                                         )
                                     )
