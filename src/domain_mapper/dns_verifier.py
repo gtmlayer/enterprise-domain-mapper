@@ -8,23 +8,48 @@ from domain_mapper.models import Confidence, DomainResult
 
 logger = logging.getLogger(__name__)
 
+# Feature-detect dnspython once, at import time, rather than swallowing the
+# ImportError on every lookup. If it is missing we degrade to A-record checks
+# only, but we say so loudly instead of silently no-opping MX verification.
+try:
+    import dns.exception
+    import dns.resolver
+
+    HAS_DNSPYTHON = True
+except ImportError:  # pragma: no cover - exercised via the HAS_DNSPYTHON flag
+    HAS_DNSPYTHON = False
+
 # Timeout for DNS lookups in seconds
 DNS_TIMEOUT = 5
 
+# Confidence ladder, weakest to strongest. An MX-verified domain is promoted
+# one rung (a brand-name guess that has live mail is a genuinely stronger signal).
+_CONFIDENCE_LADDER = [Confidence.LOW.value, Confidence.MEDIUM.value, Confidence.HIGH.value]
+
+
+def _bump_confidence(current: str) -> str:
+    """Promote a confidence value by one rung, capped at HIGH."""
+    try:
+        idx = _CONFIDENCE_LADDER.index(current)
+    except ValueError:
+        return current
+    return _CONFIDENCE_LADDER[min(idx + 1, len(_CONFIDENCE_LADDER) - 1)]
+
 
 def _check_mx(domain: str) -> bool:
-    """Check if a domain has MX records."""
-    import dns.resolver
-
+    """Check if a domain has MX records. Requires dnspython."""
+    if not HAS_DNSPYTHON:
+        return False
     try:
-        dns.resolver.resolve(domain, "MX", lifetime=DNS_TIMEOUT)
-        return True
-    except Exception:
+        answers = dns.resolver.resolve(domain, "MX", lifetime=DNS_TIMEOUT)
+        return len(answers) > 0
+    except dns.exception.DNSException:
+        # NXDOMAIN, NoAnswer, Timeout, NoNameservers etc. all subclass this.
         return False
 
 
 def _check_a(domain: str) -> bool:
-    """Check if a domain has an A record (fallback)."""
+    """Check if a domain has an A record (resolves at all)."""
     try:
         socket.setdefaulttimeout(DNS_TIMEOUT)
         socket.getaddrinfo(domain, None)
@@ -33,20 +58,19 @@ def _check_a(domain: str) -> bool:
         return False
 
 
-def _verify_single(domain: str) -> tuple[str, bool]:
-    """Verify a single domain. Returns (domain, verified)."""
-    try:
-        # Try dnspython first for MX records
-        if _check_mx(domain):
-            return (domain, True)
-    except ImportError:
-        pass
+def _verify_single(domain: str) -> tuple[str, str]:
+    """Verify a single domain.
 
-    # Fall back to A record check
+    Returns (domain, status) where status is one of:
+      "mx"         -> has MX records (treated as verified)
+      "a-only"     -> resolves an A record but no MX (weaker signal)
+      "unresolved" -> does not resolve
+    """
+    if _check_mx(domain):
+        return (domain, "mx")
     if _check_a(domain):
-        return (domain, True)
-
-    return (domain, False)
+        return (domain, "a-only")
+    return (domain, "unresolved")
 
 
 class DnsVerifier:
@@ -57,31 +81,45 @@ class DnsVerifier:
 
     def verify_domains(self, results: list[DomainResult]) -> list[DomainResult]:
         """Run DNS verification on all domain results. Updates results in place."""
-        # Only verify guessed domains (confirmed ones from SEC/Wikipedia are already good)
+        # Only check domains not already resolved (dns_verified still None)
         to_verify = [r for r in results if r.dns_verified is None]
         if not to_verify:
             return results
 
+        if not HAS_DNSPYTHON:
+            logger.warning(
+                "dnspython is not installed, so MX (mail) verification is unavailable. "
+                "Falling back to A-record resolution only, which cannot tell a real mail "
+                "domain from a parking page. Install with: pip install dnspython"
+            )
+
         domains = list({r.domain for r in to_verify})
         logger.info(f"DNS verification: checking {len(domains)} domains")
 
-        verified_domains = set()
+        status_by_domain: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {executor.submit(_verify_single, d): d for d in domains}
             for future in as_completed(futures):
-                domain, is_verified = future.result()
-                if is_verified:
-                    verified_domains.add(domain)
+                domain, status = future.result()
+                status_by_domain[domain] = status
 
-        # Update results
+        # Update results. Only an MX hit counts as "verified"; an A-only hit is
+        # recorded as a weaker, separate status and never bumps confidence.
         for result in results:
-            if result.domain in verified_domains:
+            if result.dns_verified is not None:
+                continue
+            status = status_by_domain.get(result.domain, "unresolved")
+            result.dns_status = status
+            if status == "mx":
                 result.dns_verified = True
-                if result.confidence == Confidence.LOW.value:
-                    result.confidence = Confidence.MEDIUM.value
-            elif result.dns_verified is None:
+                result.confidence = _bump_confidence(result.confidence)
+            else:
                 result.dns_verified = False
 
-        verified_count = len(verified_domains)
-        logger.info(f"DNS verification: {verified_count}/{len(domains)} domains verified")
+        mx_count = sum(1 for s in status_by_domain.values() if s == "mx")
+        a_only_count = sum(1 for s in status_by_domain.values() if s == "a-only")
+        logger.info(
+            f"DNS verification: {mx_count}/{len(domains)} MX-verified, "
+            f"{a_only_count} resolve A-only (unverified)"
+        )
         return results

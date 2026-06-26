@@ -8,6 +8,10 @@ class DomainSource(str, Enum):
     SEC_EDGAR = "SEC EDGAR"
     WIKIPEDIA = "Wikipedia"
     TLD_GUESS = "TLD guess"
+    # A .com guessed from the entity's name. The entity came from SEC/Wikipedia,
+    # but the domain itself is a guess, so it is tagged here rather than claiming
+    # the filing/article as the domain's source.
+    NAME_GUESS = "Name guess"
 
 
 class Confidence(str, Enum):
@@ -47,6 +51,12 @@ class DomainResult:
     domain: str
     domain_source: str
     dns_verified: bool | None = None
+    # How the domain resolved during DNS verification:
+    #   "mx"         -> has MX records (mail infrastructure) = treated as verified
+    #   "a-only"     -> resolves an A record but no MX (e.g. parking page) = weaker signal
+    #   "unresolved" -> did not resolve at all
+    #   None         -> not checked (verification skipped, or a confirmed-source domain)
+    dns_status: str | None = None
     confidence: str = "Low"
 
 
@@ -70,4 +80,5 @@ class CompanyResult:
 
     @property
     def guessed_domains(self) -> list[DomainResult]:
-        return [d for d in self.domains if d.domain_source == DomainSource.TLD_GUESS.value]
+        guess_sources = {DomainSource.TLD_GUESS.value, DomainSource.NAME_GUESS.value}
+        return [d for d in self.domains if d.domain_source in guess_sources]

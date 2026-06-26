@@ -17,11 +17,11 @@ HSBC
 ├── HSBC Bank USA             us.hsbc.com       [SEC EDGAR]
 ├── First Direct              firstdirect.com   [Wikipedia]
 ├── HSBC Continental Europe   hsbc.fr           [Wikipedia]
-├── HSBC UK                   hsbc.co.uk        [TLD guess ✓ DNS verified]
-├── HSBC Italy                hsbc.it           [TLD guess ✓ DNS verified]
-└── HSBC Hong Kong            hsbc.com.hk       [TLD guess ✓ DNS verified]
+├── HSBC UK                   hsbc.co.uk        [TLD guess ✓ MX verified]
+├── HSBC Italy                hsbc.it           [TLD guess ✓ MX verified]
+└── HSBC Hong Kong            hsbc.com.hk       [TLD guess ✓ MX verified]
 
-Found 12 subsidiaries, 18 domains (6 confirmed, 12 guessed, 9 DNS verified)
+Found 12 subsidiaries, 18 domains (12 guessed, 9 MX verified)
 ```
 
 ## The problem
@@ -98,7 +98,7 @@ MX record lookup with A record fallback to confirm guessed domains actually reso
 
 ### Detailed output (default)
 
-Nine columns, one row per subsidiary-domain pair:
+Ten columns, one row per subsidiary-domain pair:
 
 | Column | Description |
 |--------|-------------|
@@ -107,10 +107,11 @@ Nine columns, one row per subsidiary-domain pair:
 | `subsidiary_name` | Name of the subsidiary or entity |
 | `subsidiary_type` | Subsidiary, acquisition, division, etc. |
 | `jurisdiction` | Country or region |
-| `domain` | Confirmed or guessed domain |
-| `domain_source` | Where it came from (SEC EDGAR, Wikipedia, TLD guess) |
-| `dns_verified` | Whether DNS verification passed |
-| `confidence` | High (confirmed), Medium (guessed + verified), Low (guessed only) |
+| `domain` | Known or guessed domain |
+| `domain_source` | Where it came from (SEC EDGAR, Wikipedia, TLD guess, Name guess) |
+| `dns_verified` | `True` only when the domain has MX (mail) records |
+| `dns_status` | DNS result: `mx`, `a-only` (resolves but no mail), `unresolved`, or blank if not checked |
+| `confidence` | `High` = a guess confirmed by MX; `Medium` = an unverified name guess, or a regional guess confirmed by MX; `Low` = an unverified regional guess |
 
 ### Clay import format
 

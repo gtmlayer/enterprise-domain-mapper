@@ -101,6 +101,28 @@ def _normalise_jurisdiction(jurisdiction: str) -> str:
     return j.strip()
 
 
+# Country/jurisdiction phrases we recognise, longest first so multi-word names
+# ("united kingdom", "south korea") win over their shorter substrings.
+_COUNTRY_PHRASES = sorted(JURISDICTION_TLD_MAP.keys(), key=len, reverse=True)
+
+
+def detect_country(text: str) -> str:
+    """Find a known country/jurisdiction mentioned in free text.
+
+    Returns the canonical jurisdiction key (e.g. "italy", "united kingdom") that
+    JURISDICTION_TLD_MAP understands, or "" if none is found. Used to give
+    Wikipedia-sourced subsidiaries a jurisdiction so TLD guessing can fire for
+    them, not just for SEC EDGAR results.
+    """
+    if not text:
+        return ""
+    lowered = text.lower()
+    for phrase in _COUNTRY_PHRASES:
+        if re.search(rf"\b{re.escape(phrase)}\b", lowered):
+            return phrase
+    return ""
+
+
 def _extract_domain_base(name: str, parent_domain: str) -> list[str]:
     """Generate possible domain base strings from a subsidiary name and parent domain."""
     bases = set()
@@ -165,7 +187,11 @@ class TldGenerator:
                                 parent_company=parent_company,
                                 parent_domain=parent_domain,
                                 subsidiary_name=sub.name,
-                                subsidiary_type=sub.subsidiary_type.value if hasattr(sub.subsidiary_type, 'value') else str(sub.subsidiary_type),
+                                subsidiary_type=(
+                                    sub.subsidiary_type.value
+                                    if hasattr(sub.subsidiary_type, "value")
+                                    else str(sub.subsidiary_type)
+                                ),
                                 jurisdiction=sub.jurisdiction,
                                 domain=domain,
                                 domain_source=DomainSource.TLD_GUESS.value,

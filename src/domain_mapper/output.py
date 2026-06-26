@@ -5,7 +5,7 @@ import io
 import logging
 from typing import TextIO
 
-from domain_mapper.models import CompanyResult, DomainResult
+from domain_mapper.models import CompanyResult
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +18,7 @@ DETAILED_HEADERS = [
     "domain",
     "domain_source",
     "dns_verified",
+    "dns_status",
     "confidence",
 ]
 
@@ -39,17 +40,20 @@ def write_detailed_csv(results: list[CompanyResult], output: TextIO) -> None:
 
     for company in results:
         for domain in company.domains:
-            writer.writerow({
-                "parent_company": domain.parent_company,
-                "parent_domain": domain.parent_domain,
-                "subsidiary_name": domain.subsidiary_name,
-                "subsidiary_type": domain.subsidiary_type,
-                "jurisdiction": domain.jurisdiction,
-                "domain": domain.domain,
-                "domain_source": domain.domain_source,
-                "dns_verified": domain.dns_verified if domain.dns_verified is not None else "",
-                "confidence": domain.confidence,
-            })
+            writer.writerow(
+                {
+                    "parent_company": domain.parent_company,
+                    "parent_domain": domain.parent_domain,
+                    "subsidiary_name": domain.subsidiary_name,
+                    "subsidiary_type": domain.subsidiary_type,
+                    "jurisdiction": domain.jurisdiction,
+                    "domain": domain.domain,
+                    "domain_source": domain.domain_source,
+                    "dns_verified": domain.dns_verified if domain.dns_verified is not None else "",
+                    "dns_status": domain.dns_status or "",
+                    "confidence": domain.confidence,
+                }
+            )
 
 
 def write_clay_csv(results: list[CompanyResult], output: TextIO) -> None:
@@ -63,15 +67,17 @@ def write_clay_csv(results: list[CompanyResult], output: TextIO) -> None:
         guessed = [d.domain for d in company.guessed_domains]
         verified = [d.domain for d in company.verified_domains]
 
-        writer.writerow({
-            "company_name": company.company_name,
-            "parent_domain": company.parent_domain,
-            "subsidiary_count": len(company.subsidiaries),
-            "all_domains": "; ".join(all_domains),
-            "confirmed_domains": "; ".join(confirmed),
-            "guessed_domains": "; ".join(guessed),
-            "verified_domains": "; ".join(verified),
-        })
+        writer.writerow(
+            {
+                "company_name": company.company_name,
+                "parent_domain": company.parent_domain,
+                "subsidiary_count": len(company.subsidiaries),
+                "all_domains": "; ".join(all_domains),
+                "confirmed_domains": "; ".join(confirmed),
+                "guessed_domains": "; ".join(guessed),
+                "verified_domains": "; ".join(verified),
+            }
+        )
 
 
 def results_to_csv_string(results: list[CompanyResult], format: str = "detailed") -> str:
