@@ -11,18 +11,23 @@ Every sales team doing enterprise ABM hits the same wall: large companies have d
 This tool fixes that.
 
 ```
-$ domain-mapper "HSBC"
+$ domain-mapper "HSBC" --domain hsbc.com --verify-dns
 
 HSBC
-├── HSBC Bank USA             us.hsbc.com       [SEC EDGAR]
-├── First Direct              firstdirect.com   [Wikipedia]
-├── HSBC Continental Europe   hsbc.fr           [Wikipedia]
-├── HSBC UK                   hsbc.co.uk        [TLD guess ✓ MX verified]
-├── HSBC Italy                hsbc.it           [TLD guess ✓ MX verified]
-└── HSBC Hong Kong            hsbc.com.hk       [TLD guess ✓ MX verified]
+├── · Hang Seng Bank           hangsengbank.com        [Name guess] resolves (no MX)
+├── ✓ HSBC Bank Middle East    hsbcbankmiddleeast.com  [Name guess] ✓ MX verified
+├── ✓ HSBC UK                  hsbc.co.uk              [TLD guess]  ✓ MX verified
+├── ✓ HSBC Bank Hong Kong      hsbc.com.hk             [TLD guess]  ✓ MX verified
+├── ✓ HSBC Bank Australia      hsbc.com.au             [TLD guess]  ✓ MX verified
+├── ✓ HSBC Bank India          hsbc.co.in              [TLD guess]  ✓ MX verified
+└── ✓ HSBC Bank Malaysia       hsbc.com.my             [TLD guess]  ✓ MX verified
 
-Found 12 subsidiaries, 18 domains (12 guessed, 9 MX verified)
+Found 14 subsidiaries, 52 domains (52 guessed, 6 MX verified)
 ```
+
+The tree above is abridged: the run generates 52 candidate domains and six of them
+have live mail. Pass `--output results.csv` to get all of them with their sources
+and confidence.
 
 ## The problem
 
@@ -53,6 +58,15 @@ pip install -e .
 ```bash
 domain-mapper "Boeing"
 ```
+
+Pass the parent domain when you know it. Regional TLD guessing builds from that stem,
+so without it you get subsidiary names and `.com` guesses but no `hsbc.co.uk`:
+
+```bash
+domain-mapper "HSBC" --domain hsbc.com --verify-dns
+```
+
+In batch mode the domain column supplies this per row, so `--domain` is not needed.
 
 ### Batch mode (CSV input)
 
@@ -92,7 +106,12 @@ Once subsidiaries are identified with their jurisdictions, the tool generates li
 
 ### 4. DNS verification (optional)
 
-MX record lookup with A record fallback to confirm guessed domains actually resolve. MX records are the strongest signal - if a domain has mail infrastructure, it's real. A records confirm the domain exists even without mail setup.
+MX record lookup with A record fallback to confirm guessed domains actually resolve. A records confirm the domain exists even without mail setup.
+
+Two limits worth knowing, because both used to produce false confidence:
+
+- **An MX record is not always mail.** Registrars and parking pages publish a null MX (RFC 7505 `.`, or `localhost`, or `0.0.0.0`). `luxembourg.com` and `unitedkingdom.com` both do. Those are treated as no mail at all.
+- **Mail is not ownership.** A guessed domain with live mail proves somebody owns it, not that the company you asked about does. So a guess is capped at `Medium` however well it resolves.
 
 ## Output format
 
@@ -111,7 +130,7 @@ Ten columns, one row per subsidiary-domain pair:
 | `domain_source` | Where it came from (SEC EDGAR, Wikipedia, TLD guess, Name guess) |
 | `dns_verified` | `True` only when the domain has MX (mail) records |
 | `dns_status` | DNS result: `mx`, `a-only` (resolves but no mail), `unresolved`, or blank if not checked |
-| `confidence` | `High` = a guess confirmed by MX; `Medium` = an unverified name guess, or a regional guess confirmed by MX; `Low` = an unverified regional guess |
+| `confidence` | `High` = the domain came from a source (a filing or an article); `Medium` = a guess with live mail, or an unverified name guess; `Low` = an unverified regional guess. A guessed domain never reaches `High` on DNS alone, because mail on `chaseuk.com` proves a stranger parked it, not that Chase owns it |
 
 ### Clay import format
 

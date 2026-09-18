@@ -4,7 +4,7 @@ import logging
 import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from domain_mapper.models import Confidence, DomainResult
+from domain_mapper.models import Confidence, DomainResult, DomainSource
 
 logger = logging.getLogger(__name__)
 
@@ -22,30 +22,60 @@ except ImportError:  # pragma: no cover - exercised via the HAS_DNSPYTHON flag
 # Timeout for DNS lookups in seconds
 DNS_TIMEOUT = 5
 
-# Confidence ladder, weakest to strongest. An MX-verified domain is promoted
-# one rung (a brand-name guess that has live mail is a genuinely stronger signal).
+# Confidence ladder, weakest to strongest.
 _CONFIDENCE_LADDER = [Confidence.LOW.value, Confidence.MEDIUM.value, Confidence.HIGH.value]
 
+# Domain sources that are guesses rather than observations. A guessed domain that
+# resolves proves somebody owns it, not that the company we asked about does, so
+# DNS evidence alone can never carry one of these to High. `chaseuk.com` has live
+# mail because a stranger parked it in 2016, not because Chase runs it.
+_GUESS_SOURCES = {DomainSource.TLD_GUESS.value, DomainSource.NAME_GUESS.value}
 
-def _bump_confidence(current: str) -> str:
-    """Promote a confidence value by one rung, capped at HIGH."""
+
+def _bump_confidence(current: str, domain_source: str | None = None) -> str:
+    """Promote a confidence value by one rung.
+
+    Capped at HIGH overall, and capped at MEDIUM when the domain itself was
+    guessed. High is reserved for domains that came from a source (a filing, an
+    article), never for a guess that happened to resolve.
+    """
+    ceiling = len(_CONFIDENCE_LADDER) - 1
+    if domain_source in _GUESS_SOURCES:
+        ceiling = _CONFIDENCE_LADDER.index(Confidence.MEDIUM.value)
     try:
         idx = _CONFIDENCE_LADDER.index(current)
     except ValueError:
         return current
-    return _CONFIDENCE_LADDER[min(idx + 1, len(_CONFIDENCE_LADDER) - 1)]
+    return _CONFIDENCE_LADDER[min(idx + 1, ceiling)]
+
+
+# MX targets that advertise mail infrastructure which cannot accept a message.
+# RFC 7505 defines "." as an explicit null MX; `localhost` and `0.0.0.0` are the
+# informal equivalents that registrars and parking pages publish by default.
+_NULL_MX_TARGETS = frozenset({"", ".", "localhost", "localhost.", "0.0.0.0", "0.0.0.0."})
+
+
+def _is_null_mx(exchange: str) -> bool:
+    """True when an MX target cannot receive mail."""
+    return exchange.strip().lower() in _NULL_MX_TARGETS
 
 
 def _check_mx(domain: str) -> bool:
-    """Check if a domain has MX records. Requires dnspython."""
+    """Check if a domain has usable MX records. Requires dnspython.
+
+    The presence of an MX record is not proof of mail. `luxembourg.com` publishes
+    `0 localhost.` and `unitedkingdom.com` publishes `1000 0.0.0.0.`; both used to
+    score as verified. A domain whose every MX target is a null stub is treated as
+    having no mail at all.
+    """
     if not HAS_DNSPYTHON:
         return False
     try:
         answers = dns.resolver.resolve(domain, "MX", lifetime=DNS_TIMEOUT)
-        return len(answers) > 0
     except dns.exception.DNSException:
         # NXDOMAIN, NoAnswer, Timeout, NoNameservers etc. all subclass this.
         return False
+    return any(not _is_null_mx(str(rdata.exchange)) for rdata in answers)
 
 
 def _check_a(domain: str) -> bool:
@@ -112,7 +142,7 @@ class DnsVerifier:
             result.dns_status = status
             if status == "mx":
                 result.dns_verified = True
-                result.confidence = _bump_confidence(result.confidence)
+                result.confidence = _bump_confidence(result.confidence, result.domain_source)
             else:
                 result.dns_verified = False
 

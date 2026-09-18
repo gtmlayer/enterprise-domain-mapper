@@ -81,8 +81,26 @@ def _print_tree(result: CompanyResult) -> None:
     help="Output format: detailed (one row per domain) or clay (one row per company)",
 )
 @click.option("--verify-dns", is_flag=True, help="Verify guessed domains via DNS lookups")
+@click.option(
+    "--domain",
+    "-d",
+    "parent_domain",
+    default="",
+    help=(
+        "Parent domain for a single-company lookup, e.g. --domain hsbc.com. "
+        "Regional TLD guessing needs it: without one there is no stem to build "
+        "hsbc.co.uk from. CSV input takes this from its own domain column instead."
+    ),
+)
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
-def main(input: str, output: str | None, output_format: str, verify_dns: bool, verbose: bool):
+def main(
+    input: str,
+    output: str | None,
+    output_format: str,
+    verify_dns: bool,
+    parent_domain: str,
+    verbose: bool,
+):
     """Map enterprise companies to their subsidiary domains.
 
     INPUT can be a company name (e.g. "Boeing") or a CSV file path.
@@ -111,6 +129,11 @@ def main(input: str, output: str | None, output_format: str, verify_dns: bool, v
     results: list[CompanyResult] = []
 
     if input_path.suffix.lower() == ".csv":
+        if parent_domain:
+            console.print(
+                "[yellow]--domain is ignored for CSV input; the domain column supplies "
+                "the parent domain per row.[/yellow]"
+            )
         # Batch mode: CSV input
         results = _process_csv(mapper, input_path, verify_dns)
     else:
@@ -124,7 +147,7 @@ def main(input: str, output: str | None, output_format: str, verify_dns: bool, v
             task = progress.add_task(
                 "Searching SEC EDGAR, Wikipedia, generating TLDs...", total=None
             )
-            result = mapper.map_company(input)
+            result = mapper.map_company(input, parent_domain=parent_domain.strip())
             progress.update(task, completed=True)
 
         results = [result]
