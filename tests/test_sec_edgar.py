@@ -294,3 +294,115 @@ class TestExhibit21ProseAndHeadings:
             "JPMorgan Securities Japan Co., Ltd.",
         ):
             assert _is_entity_name(name) is True, name
+
+
+# --- Exhibit 21 jurisdiction pairing --------------------------------------
+#
+# The flat-text pass ran first and the table pass was gated behind
+# "if not subsidiaries", so the table pass never ran. The text pass "succeeded"
+# on every filing, just without jurisdictions, because a rendered table puts each
+# cell on its own line and the splitter only pairs cells within one line.
+# JPMorgan Chase filed 18 entities with jurisdictions and all 18 arrived empty.
+
+from bs4 import BeautifulSoup  # noqa: E402
+
+JPM_TABLE = """
+<html><body><table>
+  <tr><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>December&#160;31, 2025Name</td><td>Organized UnderThe Laws Of</td></tr>
+  <tr><td>JPMorgan Chase Bank, National Association</td><td>United States</td></tr>
+  <tr><td></td><td></td></tr>
+  <tr><td>JPMorgan Securities Japan Co., Ltd.</td><td>Japan</td></tr>
+  <tr><td>J.P. Morgan Securities plc</td><td>United Kingdom</td></tr>
+  <tr><td>J.P. Morgan SE</td><td>Germany</td></tr>
+</table></body></html>
+"""
+
+
+class TestExhibit21TableParse:
+    def test_table_parse_keeps_jurisdictions(self):
+        from domain_mapper.sources.sec_edgar import _parse_exhibit_tables
+
+        subs = _parse_exhibit_tables(BeautifulSoup(JPM_TABLE, "html.parser"))
+        got = {s.name: s.jurisdiction for s in subs}
+
+        assert got["JPMorgan Securities Japan Co., Ltd."] == "Japan"
+        assert got["J.P. Morgan Securities plc"] == "United Kingdom"
+        assert got["J.P. Morgan SE"] == "Germany"
+        assert all(s.jurisdiction for s in subs), "every row must carry its jurisdiction"
+
+    def test_table_parse_drops_header_and_spacer_rows(self):
+        from domain_mapper.sources.sec_edgar import _parse_exhibit_tables
+
+        subs = _parse_exhibit_tables(BeautifulSoup(JPM_TABLE, "html.parser"))
+        names = [s.name for s in subs]
+
+        assert len(subs) == 4
+        assert not any("Organized Under" in n for n in names)
+        assert not any("2025" in n for n in names)
+
+    def test_boeing_style_header_is_dropped(self):
+        """Boeing's header is a bare "Name" / "Place of Incorporation" pair."""
+        from domain_mapper.sources.sec_edgar import _parse_exhibit_tables
+
+        html = """<table>
+          <tr><td>Name</td><td>Place of Incorporation</td></tr>
+          <tr><td>Astro Limited</td><td>Bermuda</td></tr>
+          <tr><td>Aviall, Inc.</td><td>Delaware</td></tr>
+        </table>"""
+        subs = _parse_exhibit_tables(BeautifulSoup(html, "html.parser"))
+
+        assert [(s.name, s.jurisdiction) for s in subs] == [
+            ("Astro Limited", "Bermuda"),
+            ("Aviall, Inc.", "Delaware"),
+        ]
+
+
+class TestExhibit21LineParse:
+    """The fallback, for filings that are not tables."""
+
+    def test_pairs_a_name_with_the_jurisdiction_on_the_next_line(self):
+        from domain_mapper.sources.sec_edgar import _parse_exhibit_lines
+
+        html = "<p>J.P. Morgan SE<br/>Germany<br/>Paymentech, LLC<br/>United States</p>"
+        subs = _parse_exhibit_lines(BeautifulSoup(html, "html.parser"))
+
+        assert [(s.name, s.jurisdiction) for s in subs] == [
+            ("J.P. Morgan SE", "Germany"),
+            ("Paymentech, LLC", "United States"),
+        ]
+
+    def test_does_not_swallow_the_next_entity_as_a_jurisdiction(self):
+        """The dangerous case: consuming a following line that is another company."""
+        from domain_mapper.sources.sec_edgar import _parse_exhibit_lines
+
+        html = "<p>Paymentech, LLC<br/>J.P. Morgan Securities LLC<br/>Astro Limited</p>"
+        subs = _parse_exhibit_lines(BeautifulSoup(html, "html.parser"))
+
+        assert len(subs) == 3, "no entity may be eaten as another's jurisdiction"
+        assert all(s.jurisdiction == "" for s in subs)
+
+    def test_same_line_pairing_still_works(self):
+        from domain_mapper.sources.sec_edgar import _parse_exhibit_lines
+
+        html = "<pre>Astro Limited     Bermuda\nAviall, Inc.      Delaware</pre>"
+        subs = _parse_exhibit_lines(BeautifulSoup(html, "html.parser"))
+
+        assert [(s.name, s.jurisdiction) for s in subs] == [
+            ("Astro Limited", "Bermuda"),
+            ("Aviall, Inc.", "Delaware"),
+        ]
+
+
+class TestJurisdictionRecogniser:
+    def test_recognises_places(self):
+        from domain_mapper.sources.sec_edgar import _is_jurisdiction
+
+        for place in ("Germany", "United Kingdom", "Japan", "Luxembourg", "Delaware", "Bermuda"):
+            assert _is_jurisdiction(place) is True, place
+
+    def test_rejects_companies_and_blanks(self):
+        from domain_mapper.sources.sec_edgar import _is_jurisdiction
+
+        for value in ("J.P. Morgan SE", "Paymentech, LLC", "", "   ", "Organized Under"):
+            assert _is_jurisdiction(value) is False, value

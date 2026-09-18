@@ -385,6 +385,18 @@ _MONTHS = (
 )
 
 
+def _is_jurisdiction(value: str) -> bool:
+    """True when a cell is a recognised place of incorporation rather than an entity.
+
+    Used to decide whether the line after an entity name is that entity's jurisdiction
+    or the next entity. Strict on purpose: consuming the wrong line would silently
+    delete a subsidiary, so an unrecognised place leaves the jurisdiction empty rather
+    than eating the following row.
+    """
+    low = re.sub(r"\s+", " ", value or "").strip().lower().strip(" .,;:")
+    return bool(low) and (low in _US_STATES or low in _COUNTRIES)
+
+
 def _is_entity_name(name: str) -> bool:
     """True when a parsed Exhibit 21 cell looks like a company rather than table furniture."""
     cleaned = re.sub(r"\s+", " ", name or "").strip().strip("*").strip()
@@ -573,72 +585,118 @@ class SecEdgarSource:
         return None
 
     def _parse_exhibit_21(self, exhibit_url: str) -> list[Subsidiary]:
-        """Parse an Exhibit 21 document to extract subsidiaries."""
+        """Parse an Exhibit 21 document to extract subsidiaries.
+
+        The HTML table is tried first and the flat-text pass is the fallback. It used
+        to be the other way round, gated behind `if not subsidiaries`, so the table
+        branch effectively never ran: the text pass always "succeeded", just without
+        jurisdictions. JPMorgan Chase's filing states United States, Japan, United
+        Kingdom, Germany, India and Luxembourg, and every one of them was discarded,
+        which left regional TLD guessing with no stem to build from.
+        """
         _rate_limit()
-        subsidiaries = []
         try:
             resp = requests.get(exhibit_url, headers=HEADERS, timeout=15)
             resp.raise_for_status()
-
             soup = BeautifulSoup(resp.text, "html.parser")
-            text = soup.get_text("\n", strip=True)
 
-            # Exhibit 21 typically lists subsidiaries as:
-            # "Subsidiary Name    State/Country of Incorporation"
-            # or in table rows
-            lines = text.split("\n")
-
-            for line in lines:
-                line = line.strip()
-                if not line or len(line) < 5:
-                    continue
-
-                # Try to split into name and jurisdiction
-                # Common patterns: tabs, multiple spaces, or specific delimiters
-                parts = re.split(r"\t+|\s{3,}", line, maxsplit=1)
-                if len(parts) >= 2:
-                    name = parts[0].strip().strip("*").strip()
-                    jurisdiction = parts[1].strip().strip("*").strip()
-                    if _is_entity_name(name) and len(jurisdiction) > 1:
-                        subsidiaries.append(
-                            Subsidiary(
-                                name=name,
-                                jurisdiction=jurisdiction,
-                                subsidiary_type=SubsidiaryType.SUBSIDIARY,
-                                source=DomainSource.SEC_EDGAR,
-                            )
-                        )
-                elif _is_entity_name(line) and not line.startswith("("):
-                    # Single column - just the name
-                    subsidiaries.append(
-                        Subsidiary(
-                            name=line.strip("*").strip(),
-                            jurisdiction="",
-                            subsidiary_type=SubsidiaryType.SUBSIDIARY,
-                            source=DomainSource.SEC_EDGAR,
-                        )
-                    )
-
-            # Also try parsing HTML tables
+            subsidiaries = _parse_exhibit_tables(soup)
             if not subsidiaries:
-                for table in soup.find_all("table"):
-                    for row in table.find_all("tr"):
-                        cells = row.find_all(["td", "th"])
-                        if len(cells) >= 2:
-                            name = cells[0].get_text(strip=True).strip("*").strip()
-                            jurisdiction = cells[1].get_text(strip=True).strip("*").strip()
-                            if _is_entity_name(name) and len(jurisdiction) > 1:
-                                subsidiaries.append(
-                                    Subsidiary(
-                                        name=name,
-                                        jurisdiction=jurisdiction,
-                                        subsidiary_type=SubsidiaryType.SUBSIDIARY,
-                                        source=DomainSource.SEC_EDGAR,
-                                    )
-                                )
+                subsidiaries = _parse_exhibit_lines(soup)
 
         except Exception as e:
             logger.warning(f"Failed to parse Exhibit 21 at {exhibit_url}: {e}")
+            subsidiaries = []
 
-        logger.info(f"SEC EDGAR: found {len(subsidiaries)} subsidiaries")
+        with_jurisdiction = sum(1 for s in subsidiaries if s.jurisdiction)
+        logger.info(
+            f"SEC EDGAR: found {len(subsidiaries)} subsidiaries "
+            f"({with_jurisdiction} with a jurisdiction)"
+        )
         return subsidiaries
+
+
+def _parse_exhibit_tables(soup: BeautifulSoup) -> list[Subsidiary]:
+    """Parse Exhibit 21 from its HTML table: column one the entity, column two the place.
+
+    Filings pad their tables with empty spacer cells, so blanks are dropped before the
+    columns are read. The header row is rejected by `_is_entity_name` on the name cell
+    ("Name", "December 31, 2025Name"), with a light guard on the jurisdiction cell for
+    the concatenated variants ("Organized UnderThe Laws Of").
+    """
+    subsidiaries: list[Subsidiary] = []
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
+            cells = [c for c in cells if c]
+            if len(cells) < 2:
+                continue
+
+            name = cells[0].strip("*").strip()
+            jurisdiction = cells[1].strip("*").strip()
+            if not _is_entity_name(name) or len(jurisdiction) <= 1:
+                continue
+            if re.search(r"laws of|incorporation|jurisdiction", jurisdiction, re.I):
+                continue
+
+            subsidiaries.append(
+                Subsidiary(
+                    name=name,
+                    jurisdiction=jurisdiction,
+                    subsidiary_type=SubsidiaryType.SUBSIDIARY,
+                    source=DomainSource.SEC_EDGAR,
+                )
+            )
+    return subsidiaries
+
+
+def _parse_exhibit_lines(soup: BeautifulSoup) -> list[Subsidiary]:
+    """Parse Exhibit 21 from flat text, for filings that are not tables.
+
+    Two shapes are handled: name and place separated by tabs or runs of spaces on one
+    line, and name on one line with its place on the next. The second only consumes the
+    following line when that line is a recognised jurisdiction, so an unrecognised place
+    costs an empty jurisdiction rather than swallowing the next subsidiary.
+    """
+    text = soup.get_text("\n", strip=True)
+    lines = [line.strip() for line in text.split("\n")]
+    lines = [line for line in lines if line]
+
+    subsidiaries: list[Subsidiary] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+
+        parts = re.split(r"\t+|\s{3,}", line, maxsplit=1)
+        if len(parts) >= 2:
+            name = parts[0].strip().strip("*").strip()
+            jurisdiction = parts[1].strip().strip("*").strip()
+            if _is_entity_name(name) and len(jurisdiction) > 1:
+                subsidiaries.append(
+                    Subsidiary(
+                        name=name,
+                        jurisdiction=jurisdiction,
+                        subsidiary_type=SubsidiaryType.SUBSIDIARY,
+                        source=DomainSource.SEC_EDGAR,
+                    )
+                )
+                index += 1
+                continue
+
+        if _is_entity_name(line) and not line.startswith("("):
+            jurisdiction = ""
+            if index + 1 < len(lines) and _is_jurisdiction(lines[index + 1]):
+                jurisdiction = lines[index + 1].strip("*").strip()
+                index += 1
+            subsidiaries.append(
+                Subsidiary(
+                    name=line.strip("*").strip(),
+                    jurisdiction=jurisdiction,
+                    subsidiary_type=SubsidiaryType.SUBSIDIARY,
+                    source=DomainSource.SEC_EDGAR,
+                )
+            )
+
+        index += 1
+
+    return subsidiaries
