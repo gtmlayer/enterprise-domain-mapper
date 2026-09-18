@@ -4,6 +4,7 @@ import logging
 
 from domain_mapper.dns_verifier import DnsVerifier
 from domain_mapper.models import CompanyResult, Confidence, DomainResult, DomainSource
+from domain_mapper.sources.cert_transparency import CertTransparencySource
 from domain_mapper.sources.sec_edgar import SecEdgarSource
 from domain_mapper.sources.tld_generator import TldGenerator
 from domain_mapper.sources.wikipedia import WikipediaSource
@@ -18,6 +19,7 @@ class DomainMapper:
         self.sec_edgar = SecEdgarSource()
         self.wikipedia = WikipediaSource()
         self.tld_generator = TldGenerator()
+        self.cert_transparency = CertTransparencySource()
         self.dns_verifier = DnsVerifier() if verify_dns else None
         self.verify_dns = verify_dns
 
@@ -92,7 +94,41 @@ class DomainMapper:
                 result.domains.append(td)
                 existing.add(td.domain.lower())
 
-        # 4. DNS verification (optional)
+        # 4. Domains observed in certificate transparency logs.
+        #
+        # Unlike everything above, these are not derived from a subsidiary list, so they
+        # reach brands that are not legal entities and never appear in a filing. They run
+        # last so that anything already found by name or TLD keeps its own provenance.
+        guessed_sources = {DomainSource.TLD_GUESS.value, DomainSource.NAME_GUESS.value}
+        try:
+            by_domain = {d.domain.lower(): d for d in result.domains}
+            for cert_domain in self.cert_transparency.get_domains(company_name, parent_domain):
+                key = cert_domain.domain.lower()
+                already = by_domain.get(key)
+
+                if already is None:
+                    result.domains.append(cert_domain)
+                    existing.add(key)
+                    by_domain[key] = cert_domain
+                    continue
+
+                # The same domain reached by both routes. A certificate is direct
+                # evidence about the domain; a guess is not, so the stronger provenance
+                # wins even though the guess got here first. Without this, jpmorgan.co.uk
+                # keeps "TLD guess" and is capped at Medium, despite sitting in the logs
+                # and running on JPMorgan's own mail tenant.
+                #
+                # The guess's entity and jurisdiction are kept: the log knows a domain
+                # exists, but not which subsidiary or country it belongs to.
+                if already.domain_source in guessed_sources:
+                    already.domain_source = DomainSource.CERT_TRANSPARENCY.value
+                    if already.confidence == Confidence.LOW.value:
+                        already.confidence = Confidence.MEDIUM.value
+        except Exception as e:
+            result.errors.append(f"Certificate log error: {e}")
+            logger.warning(f"Certificate logs failed for '{company_name}': {e}")
+
+        # 5. DNS verification (optional)
         if self.dns_verifier and result.domains:
             result.domains = self.dns_verifier.verify_domains(result.domains)
 

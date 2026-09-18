@@ -27,7 +27,7 @@ def test_bump_confidence_ladder():
 
 
 def test_mx_marks_verified_and_bumps(monkeypatch):
-    monkeypatch.setattr(dv, "_check_mx", lambda d: True)
+    monkeypatch.setattr(dv, "_mx_hosts", lambda d: ["mx.example.com"])
     monkeypatch.setattr(dv, "_check_a", lambda d: True)
     out = DnsVerifier().verify_domains([_result("mail.example.com")])[0]
     assert out.dns_verified is True
@@ -38,7 +38,7 @@ def test_mx_marks_verified_and_bumps(monkeypatch):
 def test_a_only_is_not_verified_and_does_not_bump(monkeypatch):
     # GTM-665: a parking page that resolves an A record but has no MX must NOT
     # be treated as verified, and must not gain confidence.
-    monkeypatch.setattr(dv, "_check_mx", lambda d: False)
+    monkeypatch.setattr(dv, "_mx_hosts", lambda d: [])
     monkeypatch.setattr(dv, "_check_a", lambda d: True)
     out = DnsVerifier().verify_domains([_result("parked.example.com")])[0]
     assert out.dns_verified is False
@@ -47,7 +47,7 @@ def test_a_only_is_not_verified_and_does_not_bump(monkeypatch):
 
 
 def test_unresolved(monkeypatch):
-    monkeypatch.setattr(dv, "_check_mx", lambda d: False)
+    monkeypatch.setattr(dv, "_mx_hosts", lambda d: [])
     monkeypatch.setattr(dv, "_check_a", lambda d: False)
     out = DnsVerifier().verify_domains([_result("nope.invalid")])[0]
     assert out.dns_verified is False
@@ -70,7 +70,7 @@ def test_check_mx_returns_false_without_dnspython(monkeypatch):
 
 
 def test_already_verified_results_are_left_untouched(monkeypatch):
-    monkeypatch.setattr(dv, "_check_mx", lambda d: True)
+    monkeypatch.setattr(dv, "_mx_hosts", lambda d: ["mx.example.com"])
     r = _result("confirmed.example.com")
     r.dns_verified = True  # pretend it came confirmed from a source
     out = DnsVerifier().verify_domains([r])[0]
@@ -151,7 +151,9 @@ class TestGuessedDomainsCannotReachHigh:
         import domain_mapper.dns_verifier as dv
         from domain_mapper.models import Confidence, DomainResult, DomainSource
 
-        monkeypatch.setattr(dv, "_verify_single", lambda d: (d, "mx"))
+        monkeypatch.setattr(
+            dv, "_verify_single", lambda d: (d, "mx", ["mx.godaddy-parked.example"])
+        )
 
         results = [
             DomainResult(
@@ -173,3 +175,98 @@ class TestGuessedDomainsCannotReachHigh:
 
         for result in dv.DnsVerifier().verify_domains(results):
             assert result.confidence != Confidence.HIGH.value, result.domain
+
+
+# --- Shared-mail ownership test -------------------------------------------
+#
+# The discriminator that separates a real regional domain from a parked lookalike.
+# jpmorgan.co.uk and jpmorgan.com both sit on us.messagelabs.com; chaseuk.com has live
+# mail on GoDaddy and chaseuk.co.uk on IONOS, and neither belongs to Chase.
+
+
+class TestSharesMailWithParent:
+    def test_same_mail_tenant(self):
+        assert dv.shares_mail_with_parent(
+            ["cluster14a.us.messagelabs.com"], ["cluster14.us.messagelabs.com"], "jpmorgan.com"
+        )
+
+    def test_mx_pointing_straight_at_the_parent(self):
+        """jpmorganchase.de resolves to threshold2.jpmorgan.com."""
+        assert dv.shares_mail_with_parent(["threshold2.jpmorgan.com"], [], "jpmorgan.com")
+
+    def test_parked_domains_do_not_match(self):
+        for host in ("mailstore1.secureserver.net", "mx00.ionos.co.uk"):
+            assert not dv.shares_mail_with_parent(
+                [host], ["cluster14.us.messagelabs.com"], "jpmorgan.com"
+            )
+
+    def test_no_mail_does_not_match(self):
+        assert not dv.shares_mail_with_parent([], ["cluster14.us.messagelabs.com"], "jpmorgan.com")
+
+
+class TestCertPromotion:
+    """A certificate-observed domain reaches High only on the group's own mail."""
+
+    @staticmethod
+    def _cert(domain):
+        from domain_mapper.models import DomainResult
+
+        return DomainResult(
+            parent_company="JPMorgan Chase",
+            parent_domain="jpmorganchase.com",
+            subsidiary_name="(certificate log)",
+            subsidiary_type="Observed domain",
+            jurisdiction="",
+            domain=domain,
+            domain_source=DomainSource.CERT_TRANSPARENCY.value,
+            confidence=Confidence.MEDIUM.value,
+        )
+
+    def test_group_tenant_promotes_to_high(self, monkeypatch):
+        """Two observed domains agreeing on a tenant establish it as the group's."""
+        hosts = {
+            "jpmorganfunds.com": ["cluster14a.us.messagelabs.com"],
+            "jpmorganclimatecare.com": ["cluster14.us.messagelabs.com"],
+        }
+        monkeypatch.setattr(dv, "_mx_hosts", lambda d: hosts.get(d, []))
+        monkeypatch.setattr(dv, "_verify_single", lambda d: (d, "mx", hosts.get(d, [])))
+
+        out = dv.DnsVerifier().verify_domains([self._cert(d) for d in hosts])
+        assert all(r.confidence == Confidence.HIGH.value for r in out)
+
+    def test_a_single_domain_cannot_define_the_group_tenant(self, monkeypatch):
+        """One squatter on its own mail must not become the reference."""
+        hosts = {"jpmorgan-not-really.com": ["mailstore1.secureserver.net"]}
+        monkeypatch.setattr(dv, "_mx_hosts", lambda d: hosts.get(d, []))
+        monkeypatch.setattr(dv, "_verify_single", lambda d: (d, "mx", hosts.get(d, [])))
+
+        out = dv.DnsVerifier().verify_domains([self._cert("jpmorgan-not-really.com")])
+        assert out[0].confidence == Confidence.MEDIUM.value
+
+    def test_a_guess_on_the_group_tenant_still_stays_medium(self, monkeypatch):
+        """Deliberate boundary: guesses cap at Medium, which is a separate decision."""
+        from domain_mapper.models import DomainResult
+
+        hosts = {
+            "a.com": ["cluster14a.us.messagelabs.com"],
+            "b.com": ["cluster14.us.messagelabs.com"],
+            "guessed.com": ["cluster14.us.messagelabs.com"],
+        }
+        monkeypatch.setattr(dv, "_mx_hosts", lambda d: hosts.get(d, []))
+        monkeypatch.setattr(dv, "_verify_single", lambda d: (d, "mx", hosts.get(d, [])))
+
+        guess = DomainResult(
+            parent_company="JPMorgan Chase",
+            parent_domain="jpmorganchase.com",
+            subsidiary_name="Chase UK",
+            subsidiary_type="Subsidiary",
+            jurisdiction="uk",
+            domain="guessed.com",
+            domain_source=DomainSource.TLD_GUESS.value,
+            confidence=Confidence.MEDIUM.value,
+        )
+        out = dv.DnsVerifier().verify_domains([self._cert("a.com"), self._cert("b.com"), guess])
+        by_domain = {r.domain: r.confidence for r in out}
+
+        assert by_domain["a.com"] == Confidence.HIGH.value
+        assert by_domain["guessed.com"] == Confidence.MEDIUM.value

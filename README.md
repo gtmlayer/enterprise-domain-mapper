@@ -14,20 +14,25 @@ This tool fixes that.
 $ domain-mapper "HSBC" --domain hsbc.com --verify-dns
 
 HSBC
-├── · Hang Seng Bank           hangsengbank.com        [Name guess] resolves (no MX)
-├── ✓ HSBC Bank Middle East    hsbcbankmiddleeast.com  [Name guess] ✓ MX verified
-├── ✓ HSBC UK                  hsbc.co.uk              [TLD guess]  ✓ MX verified
-├── ✓ HSBC Bank Hong Kong      hsbc.com.hk             [TLD guess]  ✓ MX verified
-├── ✓ HSBC Bank Australia      hsbc.com.au             [TLD guess]  ✓ MX verified
-├── ✓ HSBC Bank India          hsbc.co.in              [TLD guess]  ✓ MX verified
-└── ✓ HSBC Bank Malaysia       hsbc.com.my             [TLD guess]  ✓ MX verified
+├── · Hang Seng Bank                 hangsengbank.com         [Name guess] resolves (no MX)
+├── ✓ HSBC Bank Middle East          hsbcbankmiddleeast.com   [Name guess] ✓ MX verified
+├── ✓ HSBC Bank Australia            hsbc.com.au              [Certificate log] ✓ MX verified
+├── ✓ HSBC Bank Hong Kong            hsbc.com.hk              [Certificate log] ✓ MX verified
+├── ✓ HSBC UK                        hsbc.co.uk               [Certificate log] ✓ MX verified
+├── ✓ (certificate log, 327 certs)   hsbcnet.com              [Certificate log] ✓ MX verified
+├── ✓ (certificate log, 208 certs)   hsbc.com.mx              [Certificate log] ✓ MX verified
+└── ✓ (certificate log, 122 certs)   hsbc.fr                  [Certificate log] ✓ MX verified
 
-Found 14 subsidiaries, 52 domains (52 guessed, 6 MX verified)
+Found 14 subsidiaries, 107 domains (47 guessed, 33 MX verified)
 ```
 
-The tree above is abridged: the run generates 52 candidate domains and six of them
-have live mail. Pass `--output results.csv` to get all of them with their sources
-and confidence.
+The tree above is abridged: the run generates 107 candidate domains, 33 of them have
+live mail, and 23 are rated `High` because their mail runs on HSBC's own tenant. Pass
+`--output results.csv` to get all of them with their sources and confidence.
+
+Rows labelled `(certificate log, N certs)` are domains found in the logs that no
+subsidiary list mentions, so there is no entity name to attach. The certificate count is
+the ranking signal: a domain on 327 certificates is core infrastructure.
 
 ## The problem
 
@@ -86,7 +91,7 @@ This checks whether guessed domains actually have mail infrastructure (MX record
 
 ## What it does
 
-The tool combines three data sources and a verification layer to build comprehensive domain maps:
+The tool combines four data sources and a verification layer to build comprehensive domain maps:
 
 ### 1. SEC EDGAR Exhibit 21 scraper
 
@@ -104,7 +109,27 @@ Covers companies globally, though data depth varies by how well-maintained the W
 
 Once subsidiaries are identified with their jurisdictions, the tool generates likely domain patterns. A subsidiary in Italy with parent domain `hsbc.com` produces guesses like `hsbc.it`. Covers 70+ countries with their standard corporate TLD patterns (e.g. UK produces `co.uk` and `.uk`, Japan produces `co.jp` and `.jp`).
 
-### 4. DNS verification (optional)
+### 4. Certificate transparency logs
+
+Every publicly trusted certificate is published to a public log. Searching those logs
+surfaces domains a company has demonstrably operated, rather than domains guessed from
+a name, and it reaches brands that are not legal entities and so appear in no filing.
+
+This matters because the first two sources structurally cannot answer "what are all
+their domains". Exhibit 21 lists only *significant subsidiaries*: JPMorgan Chase files
+18, for a bank with hundreds of entities. Wikipedia lists whatever an editor typed into
+an infobox. Neither is a brand register. The logs are the closest free thing to one.
+
+For HSBC this is the difference between 6 confirmed mail domains and 33.
+
+A certificate proves somebody operated a name, not that this company owns it, so these
+arrive as candidates rather than facts. See the confidence rules below.
+
+**Limitation worth knowing:** the search keys on the company's own name stem, so brands
+whose domains do not carry the parent's name are still missed. HSBC's First Direct and
+M&S Bank do not appear, because `firstdirect.com` contains no "hsbc".
+
+### 5. DNS verification (optional)
 
 MX record lookup with A record fallback to confirm guessed domains actually resolve. A records confirm the domain exists even without mail setup.
 
@@ -130,7 +155,7 @@ Ten columns, one row per subsidiary-domain pair:
 | `domain_source` | Where it came from (SEC EDGAR, Wikipedia, TLD guess, Name guess) |
 | `dns_verified` | `True` only when the domain has MX (mail) records |
 | `dns_status` | DNS result: `mx`, `a-only` (resolves but no mail), `unresolved`, or blank if not checked |
-| `confidence` | `High` = the domain came from a source (a filing or an article); `Medium` = a guess with live mail, or an unverified name guess; `Low` = an unverified regional guess. A guessed domain never reaches `High` on DNS alone, because mail on `chaseuk.com` proves a stranger parked it, not that Chase owns it |
+| `confidence` | `High` = observed in the certificate logs **and** its mail runs on the group's own tenant; `Medium` = observed in the logs, or a guess with live mail; `Low` = an unverified guess. A guessed domain never reaches `High` on DNS alone, because mail on `chaseuk.com` proves a stranger parked it in 2016, not that Chase owns it |
 
 ### Clay import format
 
