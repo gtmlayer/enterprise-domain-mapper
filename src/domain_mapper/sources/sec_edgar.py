@@ -66,15 +66,86 @@ def _normalise_company(name: str) -> str:
     return " ".join(words)
 
 
+def _leading_runs(tokens: list[str]) -> set[str]:
+    """Every despaced leading run of whole tokens: [a, b, c] -> {a, ab, abc}."""
+    runs: set[str] = set()
+    acc = ""
+    for token in tokens:
+        acc += token
+        runs.add(acc)
+    return runs
+
+
+def _is_token_prefix(short: list[str], long: list[str]) -> bool:
+    """True when `short` is a leading run of whole tokens in `long`."""
+    return bool(short) and len(short) < len(long) and long[: len(short)] == short
+
+
+def _match_score(query: str, title: str) -> int:
+    """Score how well `title` matches `query`. 0 means no match.
+
+    Three rungs, all anchored on whole tokens:
+
+      3 - exact normalised match
+      2 - one side, despaced, equals a leading run of whole tokens in the other
+          ("JP Morgan" -> "jpmorgan" meets the "JPMORGAN" token of JPMORGAN CHASE)
+      1 - one side is a leading run of whole tokens in the other
+
+    Bare substring containment is deliberately absent. It is what mapped
+    "JP Morgan" to MORGAN GROUP HOLDING CO: stripping corporate suffixes from that
+    title leaves the single token "morgan", which is contained in "jp morgan", and
+    the shortest-title tie-break then preferred it over the real filer. A title
+    that collapses to one generic token must not be able to swallow a longer query.
+    """
+    norm_query = _normalise_company(query)
+    norm_title = _normalise_company(title)
+    if not norm_query or not norm_title:
+        return 0
+
+    if norm_query == norm_title:
+        return 3
+
+    query_tokens = norm_query.split()
+    title_tokens = norm_title.split()
+
+    query_despaced = norm_query.replace(" ", "")
+    title_despaced = norm_title.replace(" ", "")
+    if query_despaced in _leading_runs(title_tokens) or title_despaced in _leading_runs(
+        query_tokens
+    ):
+        return 2
+
+    if _is_token_prefix(query_tokens, title_tokens) or _is_token_prefix(title_tokens, query_tokens):
+        return 1
+
+    return 0
+
+
+def _names_match(query: str, title: str) -> bool:
+    """True when two company names match on any rung of `_match_score`."""
+    return _match_score(query, title) > 0
+
+
+def _strip_display_name(display_name: str) -> str:
+    """Take the entity name out of an EDGAR display name.
+
+    "JPMORGAN CHASE & CO  (JPM)  (CIK 0000019617)" -> "JPMORGAN CHASE & CO"
+    """
+    return display_name.split("(")[0].strip()
+
+
 def _match_cik_from_tickers(tickers: dict, company_name: str) -> str | None:
     """Find the best-matching CIK for a company name in the company_tickers.json payload.
 
     Pure function (no network) so it can be unit-tested with a fixture. Ranks
-    candidates: exact normalised match > prefix match > substring match, breaking
-    ties by the shortest title (closest match). Returns a zero-padded 10-digit CIK.
+    candidates by `_match_score`, breaking ties by the shortest title (closest
+    match). Returns a zero-padded 10-digit CIK, or None where nothing matches.
+
+    None is the right answer far more often than it looks. EDGAR only holds SEC
+    registrants, so a non-US company has no CIK at all and any US filer returned
+    for one is wrong by construction.
     """
-    query = _normalise_company(company_name)
-    if not query:
+    if not _normalise_company(company_name):
         return None
 
     best_cik: str | None = None
@@ -86,25 +157,278 @@ def _match_cik_from_tickers(tickers: dict, company_name: str) -> str | None:
         cik_str = entry.get("cik_str")
         if cik_str is None or not title:
             continue
-        norm_title = _normalise_company(title)
-        if not norm_title:
+
+        score = _match_score(company_name, title)
+        if score == 0:
             continue
 
-        if norm_title == query:
-            score = 3
-        elif norm_title.startswith(query) or query.startswith(norm_title):
-            score = 2
-        elif query in norm_title or norm_title in query:
-            score = 1
-        else:
-            continue
-
-        if score > best_score or (score == best_score and len(norm_title) < best_len):
+        norm_len = len(_normalise_company(title))
+        if score > best_score or (score == best_score and norm_len < best_len):
             best_score = score
-            best_len = len(norm_title)
+            best_len = norm_len
             best_cik = str(cik_str).zfill(10)
 
     return best_cik
+
+
+# Exhibit 21 is a rendered HTML table, so a naive text pass picks up the table's own
+# furniture alongside the subsidiaries: column headers, the filing's jurisdiction
+# cells, the exhibit label and the HTML filename. Those then flow downstream as if
+# they were companies, which is how `germany.com` and `thelawsof.com` ended up in a
+# JPMorgan Chase domain map. Everything below is rejected by whole-string match, so a
+# real entity such as "Delaware Trust Company" survives while a bare "Delaware" does not.
+
+_US_STATES = (
+    frozenset("""alabama alaska arizona arkansas california colorado connecticut delaware florida
+    georgia hawaii idaho illinois indiana iowa kansas kentucky louisiana maine maryland
+    massachusetts michigan minnesota mississippi missouri montana nebraska nevada ohio
+    oklahoma oregon pennsylvania tennessee texas utah vermont virginia washington
+    wisconsin wyoming""".split())
+    | frozenset(
+        {
+            "new hampshire",
+            "new jersey",
+            "new mexico",
+            "new york",
+            "north carolina",
+            "north dakota",
+            "rhode island",
+            "south carolina",
+            "south dakota",
+            "west virginia",
+            "district of columbia",
+            "puerto rico",
+            "virgin islands",
+            "guam",
+            "american samoa",
+            "northern mariana islands",
+        }
+    )
+)
+
+_COUNTRIES = frozenset(
+    {
+        "united states",
+        "united states of america",
+        "usa",
+        "u s a",
+        "us",
+        "united kingdom",
+        "uk",
+        "england",
+        "scotland",
+        "wales",
+        "northern ireland",
+        "england and wales",
+        "great britain",
+        "ireland",
+        "germany",
+        "france",
+        "luxembourg",
+        "netherlands",
+        "the netherlands",
+        "switzerland",
+        "spain",
+        "italy",
+        "belgium",
+        "austria",
+        "sweden",
+        "norway",
+        "denmark",
+        "finland",
+        "poland",
+        "portugal",
+        "greece",
+        "iceland",
+        "malta",
+        "cyprus",
+        "monaco",
+        "liechtenstein",
+        "czech republic",
+        "hungary",
+        "romania",
+        "bulgaria",
+        "croatia",
+        "slovakia",
+        "slovenia",
+        "estonia",
+        "latvia",
+        "lithuania",
+        "ukraine",
+        "russia",
+        "turkey",
+        "israel",
+        "canada",
+        "mexico",
+        "brazil",
+        "argentina",
+        "chile",
+        "colombia",
+        "peru",
+        "uruguay",
+        "venezuela",
+        "ecuador",
+        "costa rica",
+        "panama",
+        "dominican republic",
+        "jamaica",
+        "bahamas",
+        "barbados",
+        "bermuda",
+        "cayman islands",
+        "british virgin islands",
+        "jersey",
+        "guernsey",
+        "isle of man",
+        "gibraltar",
+        "curacao",
+        "mauritius",
+        "trinidad and tobago",
+        "china",
+        "hong kong",
+        "macau",
+        "japan",
+        "singapore",
+        "india",
+        "australia",
+        "new zealand",
+        "south korea",
+        "korea",
+        "taiwan",
+        "malaysia",
+        "indonesia",
+        "thailand",
+        "philippines",
+        "vietnam",
+        "south africa",
+        "nigeria",
+        "kenya",
+        "egypt",
+        "morocco",
+        "uae",
+        "united arab emirates",
+        "saudi arabia",
+        "qatar",
+        "bahrain",
+        "kuwait",
+        "oman",
+    }
+)
+
+_HEADER_PHRASES = frozenset(
+    {
+        "document",
+        "documents",
+        "name",
+        "names",
+        "entity",
+        "entities",
+        "legal name",
+        "subsidiary",
+        "subsidiaries",
+        "subsidiaries of the registrant",
+        "list of subsidiaries",
+        "significant subsidiaries",
+        "name of subsidiary",
+        "name of entity",
+        "jurisdiction",
+        "jurisdiction of incorporation",
+        "jurisdiction of organization",
+        "jurisdiction of organisation",
+        "state of incorporation",
+        "state or country of incorporation",
+        "state or other jurisdiction",
+        "country of incorporation",
+        "incorporation",
+        "organized under",
+        "organised under",
+        "the laws of",
+        "laws of",
+        "organized under the laws of",
+        "organised under the laws of",
+        "percentage of",
+        "percentage owned",
+        "percent owned",
+        "percentage of voting",
+        "ownership",
+        "owned",
+        "voting",
+        "voting securities",
+        "voting power",
+        "parent",
+        "registrant",
+        "exhibit",
+        "page",
+        "table of contents",
+        "country",
+        "state",
+        "type",
+        "business name",
+        "dba",
+        "as of",
+    }
+)
+
+_MONTHS = (
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+)
+
+
+def _is_entity_name(name: str) -> bool:
+    """True when a parsed Exhibit 21 cell looks like a company rather than table furniture."""
+    cleaned = re.sub(r"\s+", " ", name or "").strip().strip("*").strip()
+    if len(cleaned) < 3:
+        return False
+
+    low = cleaned.lower().strip(" .,;:")
+    if not re.search(r"[a-z]", low):
+        return False
+    if low in _HEADER_PHRASES or low in _US_STATES or low in _COUNTRIES:
+        return False
+
+    # The exhibit's own heading. JPMorgan Chase writes it with a non-breaking space
+    # ("Exhibit\xa021"), which survives a naive header comparison.
+    if re.match(r"^exhibit\b", low):
+        return False
+
+    # Prose. Exhibit 21 often carries an explanatory sentence above the list, e.g.
+    # JPMorgan Chase's Dodd-Frank resolution-planning note, which parses as one very
+    # long "entity". No real company name runs past a dozen words.
+    if len(cleaned.split()) > 12:
+        return False
+
+    # Filenames and exhibit labels: "ex211-q425.htm", "brhc10050563_ex21-1.htm", "EX-21.1"
+    if re.search(r"\.(?:html?|pdf|txt|xml|xlsx?|jpe?g|png)$", low):
+        return False
+    if re.match(r"^ex[\s\-_.]?\d", low):
+        return False
+    if re.match(r"^[a-z]{0,6}\d{6,}", low):
+        return False
+
+    # Dates: "December 31, 2025", "as of December 28, 2012", "12/31/2025"
+    if re.match(r"^as of\b", low):
+        return False
+    if any(month in low for month in _MONTHS) and re.search(r"\b(?:19|20)\d{2}\b", low):
+        return False
+    if re.match(r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$", low):
+        return False
+
+    # Pure numbers, percentages and punctuation
+    if re.match(r"^[\d\s.,%()\-]+$", low):
+        return False
+
+    return True
 
 
 class SecEdgarSource:
@@ -138,8 +462,13 @@ class SecEdgarSource:
         """Find the CIK number for a company.
 
         Primary source is the official company_tickers.json registry (stable,
-        documented), matched with ranked normalisation. The EDGAR full-text
-        search is a secondary fallback.
+        documented), matched on whole tokens by `_match_score`.
+
+        The EDGAR full-text search is a secondary fallback, and a dangerous one:
+        it returns any filing that MENTIONS the phrase, so its top hit is often a
+        different company that happens to name this one. Its hits are therefore
+        gated on the same name match, and an unmatched hit yields None rather than
+        a guess.
         """
         # Primary: company_tickers.json (the reliable registry)
         _rate_limit()
@@ -165,10 +494,19 @@ class SecEdgarSource:
             resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
             resp.raise_for_status()
             hits = resp.json().get("hits", {}).get("hits", [])
-            if hits:
-                ciks = hits[0].get("_source", {}).get("ciks", [])
-                if ciks:
+            for hit in hits:
+                source = hit.get("_source", {})
+                ciks = source.get("ciks") or []
+                if not ciks:
+                    continue
+                names = source.get("display_names") or []
+                if any(_names_match(company_name, _strip_display_name(n)) for n in names):
                     return str(ciks[0]).zfill(10)
+            if hits:
+                logger.info(
+                    f"EDGAR full-text hits for '{company_name}' matched no entity name; "
+                    "returning no CIK rather than the top hit"
+                )
         except Exception:
             pass
 
@@ -255,30 +593,13 @@ class SecEdgarSource:
                 if not line or len(line) < 5:
                     continue
 
-                # Skip headers and boilerplate
-                if any(
-                    skip in line.lower()
-                    for skip in [
-                        "exhibit",
-                        "subsidiaries",
-                        "registrant",
-                        "name of subsidiary",
-                        "jurisdiction",
-                        "state or",
-                        "incorporated",
-                        "page",
-                        "form 10-k",
-                    ]
-                ):
-                    continue
-
                 # Try to split into name and jurisdiction
                 # Common patterns: tabs, multiple spaces, or specific delimiters
                 parts = re.split(r"\t+|\s{3,}", line, maxsplit=1)
                 if len(parts) >= 2:
                     name = parts[0].strip().strip("*").strip()
                     jurisdiction = parts[1].strip().strip("*").strip()
-                    if len(name) > 2 and len(jurisdiction) > 1:
+                    if _is_entity_name(name) and len(jurisdiction) > 1:
                         subsidiaries.append(
                             Subsidiary(
                                 name=name,
@@ -287,7 +608,7 @@ class SecEdgarSource:
                                 source=DomainSource.SEC_EDGAR,
                             )
                         )
-                elif len(line) > 5 and not line.startswith("("):
+                elif _is_entity_name(line) and not line.startswith("("):
                     # Single column - just the name
                     subsidiaries.append(
                         Subsidiary(
@@ -306,12 +627,7 @@ class SecEdgarSource:
                         if len(cells) >= 2:
                             name = cells[0].get_text(strip=True).strip("*").strip()
                             jurisdiction = cells[1].get_text(strip=True).strip("*").strip()
-                            if (
-                                len(name) > 2
-                                and len(jurisdiction) > 1
-                                and "name" not in name.lower()
-                                and "subsidiary" not in name.lower()
-                            ):
+                            if _is_entity_name(name) and len(jurisdiction) > 1:
                                 subsidiaries.append(
                                     Subsidiary(
                                         name=name,
