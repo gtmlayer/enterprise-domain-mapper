@@ -12,6 +12,10 @@ class DomainSource(str, Enum):
     # but the domain itself is a guess, so it is tagged here rather than claiming
     # the filing/article as the domain's source.
     NAME_GUESS = "Name guess"
+    # Observed in a public certificate transparency log. Not a guess: the company
+    # demonstrably operated this name at some point. Still not proof of ownership,
+    # since anyone can obtain a certificate for a name they control.
+    CERT_TRANSPARENCY = "Certificate log"
 
 
 class Confidence(str, Enum):

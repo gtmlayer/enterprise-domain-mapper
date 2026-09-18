@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "enterprise-domain-mapper"
-version = "0.2.1"
+version = "0.3.0"
 description = "Map enterprise corporate structures to enrichable domains"
 readme = "README.md"
 license = {text = "MIT"}
