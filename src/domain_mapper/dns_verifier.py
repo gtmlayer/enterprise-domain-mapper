@@ -2,6 +2,7 @@
 
 import collections
 import logging
+import re
 import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -83,41 +84,88 @@ def _mx_hosts(domain: str) -> list[str]:
     return [h for h in hosts if h and not _is_null_mx(h)]
 
 
-def _mail_tenant(host: str) -> str:
-    """The shared part of a mail provider's hostname.
+# Labels that appear in mail hostnames without identifying anybody: role prefixes,
+# regions, and the provider's own structural words. A match on one of these is a match
+# on the mail industry, not on a company.
+_GENERIC_MAIL_LABELS = frozenset(
+    """mx mx0 mx1 mx2 mx3 mxa mxb mxc mail mails email smtp imap pop in inbound out
+    outbound relay alt aspmx gw gateway cluster filter spam mta mailhost mailstore
+    secure protection gslb lb edge node host srv server com net org co inc ltd
+    us eu uk usa eur emea apac asia na sa au ca jp cn de fr it es nl global intl
+    prod prd corp""".split()
+)
 
-    "cluster14a.us.messagelabs.com" and "cluster14.us.messagelabs.com" both reduce to
-    "us.messagelabs.com", which is what makes them recognisable as one tenant.
+# A tenant token must be at least this long. Shorter strings are region codes and
+# sequence numbers, which thousands of unrelated customers share.
+_MIN_TENANT_TOKEN = 4
+
+
+def _flatten(value: str) -> str:
+    """Lowercase alphanumerics only, so "roperwhitney-com" meets "roperwhitney.com"."""
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def _is_derived_from_domain(token: str, domain: str) -> bool:
+    """True when a token is just the domain's own name in different punctuation.
+
+    Microsoft 365 names every tenant after its own domain: roperwhitney.com resolves to
+    roperwhitney-com.mail.protection.outlook.com. Two unrelated companies therefore
+    produce hostnames that look alike in structure while sharing no customer at all, so
+    a token like this says nothing about who else is on that mail system.
     """
-    parts = (host or "").split(".")
-    return ".".join(parts[-3:]) if len(parts) >= 3 else host
-
-
-def shares_mail_with_parent(
-    domain_hosts: list[str], parent_hosts: list[str], parent_domain: str
-) -> bool:
-    """True when a domain's mail is demonstrably the parent's mail.
-
-    Two ways that shows up, and both were observed on real filings:
-
-      - the same tenant: jpmorgan.co.uk and jpmorgan.com both sit on us.messagelabs.com,
-        and five HSBC regional domains share one Proofpoint tenant with hsbc.com
-      - the MX pointing straight home: jpmorganchase.de resolves to threshold2.jpmorgan.com
-
-    This is the test that separates a real regional domain from a parked lookalike.
-    chaseuk.com has live mail on GoDaddy and chaseuk.co.uk on IONOS; neither matches.
-    """
-    if not domain_hosts:
+    flat_token, flat_domain = _flatten(token), _flatten(domain)
+    if not flat_token or not flat_domain:
         return False
+    return flat_token in flat_domain or flat_domain in flat_token
 
-    parent_tenants = {_mail_tenant(h) for h in parent_hosts if h}
-    if parent_tenants & {_mail_tenant(h) for h in domain_hosts}:
-        return True
 
-    parent_registrable = registrable_domain(parent_domain)
-    if parent_registrable:
-        return any(registrable_domain(h) == parent_registrable for h in domain_hosts)
-    return False
+def tenant_identifiers(mx_hosts: list[str], domain: str) -> set[str]:
+    """Customer-specific tokens in a domain's MX hostnames.
+
+    The customer-specific part is whatever sits in front of the provider's own
+    registrable domain, minus generic mail labels and minus anything derived from the
+    domain's own name. What survives is an identifier the provider assigned:
+
+      mxa-00299f02.gslb.pphosted.com            -> {"00299f02"}  HSBC's Proofpoint id
+      ropertech-com.mail.protection.outlook.com -> set()         the domain, restated
+      cluster14.us.messagelabs.com              -> set()         a shared cluster
+
+    An empty set means the mail says nothing about who else belongs to this group,
+    which is the correct answer far more often than the previous check allowed.
+    """
+    found: set[str] = set()
+    for host in mx_hosts:
+        host = (host or "").lower().strip().rstrip(".")
+        if not host:
+            continue
+        provider = registrable_domain(host)
+        local = host[: -(len(provider) + 1)] if provider and host.endswith("." + provider) else host
+        for token in re.split(r"[.\-_]+", local):
+            # Providers number their shared infrastructure: cluster14, cluster14a, mx2,
+            # gw3197. Strip a trailing sequence, digits plus any letter suffix, before
+            # testing, so all of those reduce to the generic word they are built on. A
+            # customer id such as 00299f02 survives, because what is left ("00299f") is
+            # not a generic mail word.
+            unnumbered = re.sub(r"\d+[a-z]*$", "", token)
+            if (
+                len(token) >= _MIN_TENANT_TOKEN
+                and token not in _GENERIC_MAIL_LABELS
+                and unnumbered not in _GENERIC_MAIL_LABELS
+                and not _is_derived_from_domain(token, domain)
+            ):
+                found.add(token)
+    return found
+
+
+def mail_points_at(mx_hosts: list[str], domain: str) -> bool:
+    """True when a domain's mail is hosted inside the domain it is tested against.
+
+    jpmorganchase.de resolves to threshold2.jpmorgan.com. Nobody points their MX inside
+    someone else's domain, so this is ownership evidence in a way that merely sharing a
+    mail vendor is not.
+    """
+    target = registrable_domain(domain)
+    return bool(target) and any(registrable_domain(h) == target for h in mx_hosts)
 
 
 def _check_mx(domain: str) -> bool:
@@ -195,32 +243,38 @@ class DnsVerifier:
 
         # Establish what this group's mail actually looks like.
         #
-        # The parent domain a caller supplies is often web-only. jpmorganchase.com has no
-        # MX at all, while JPMorgan's mail runs on jpmorgan.com and chase.com, so testing
-        # only against the parent promoted nothing for JPMorgan even though four observed
-        # domains sat on the company's own messagelabs tenant.
+        # Two kinds of evidence count, and sharing a mail vendor is not one of them.
+        # An earlier version compared the last three labels of each MX hostname, which
+        # on any shared provider is the provider's own domain: ropertech.com and a
+        # funeral home called Roper and Sons both reduced to protection.outlook.com, so
+        # the funeral home was promoted as a Roper Technologies domain.
         #
-        # The reference set is therefore the parent's own tenants plus any tenant that at
-        # least two certificate-observed domains agree on. Agreement is the evidence: one
-        # squatter cannot define a group's mail. Where nothing agrees the set stays empty
-        # and nothing is promoted, which is the safe direction.
-        parent_hosts = {
-            parent: _mx_hosts(parent)
-            for parent in {r.parent_domain for r in to_verify if r.parent_domain}
-        }
-
+        # What counts is a customer identifier the provider assigned, corroborated by at
+        # least two observed domains. HSBC's Proofpoint id 00299f02 qualifies; a
+        # Microsoft 365 hostname named after the domain itself does not, and neither
+        # does a shared Symantec cluster number.
+        tenants_by_domain: dict[str, set[str]] = {}
         observed_tenants = collections.Counter()
         for result in results:
+            domain = result.domain
+            if domain in tenants_by_domain:
+                continue
             if (
                 result.domain_source == DomainSource.CERT_TRANSPARENCY.value
-                and status_by_domain.get(result.domain) == "mx"
+                and status_by_domain.get(domain) == "mx"
             ):
-                observed_tenants.update(
-                    {_mail_tenant(h) for h in hosts_by_domain.get(result.domain, [])}
-                )
+                ids = tenant_identifiers(hosts_by_domain.get(domain, []), domain)
+                tenants_by_domain[domain] = ids
+                observed_tenants.update(ids)
+
         group_tenants = {t for t, n in observed_tenants.items() if n >= 2}
         if group_tenants:
-            logger.info(f"Group mail tenants corroborated by the logs: {sorted(group_tenants)}")
+            logger.info(f"Group mail tenant ids corroborated by the logs: {sorted(group_tenants)}")
+        else:
+            logger.info(
+                "No corroborated mail tenant id: nothing will be promoted to High on "
+                "mail evidence, only on an MX inside the parent's own domain."
+            )
 
         # Update results. Only an MX hit counts as "verified"; an A-only hit is
         # recorded as a weaker, separate status and never bumps confidence.
@@ -242,10 +296,12 @@ class DnsVerifier:
             # is deliberately not promoted this way; that stays a separate decision.
             if result.domain_source == DomainSource.CERT_TRANSPARENCY.value:
                 hosts = hosts_by_domain.get(result.domain, [])
-                on_group_tenant = bool(group_tenants & {_mail_tenant(h) for h in hosts})
-                if on_group_tenant or shares_mail_with_parent(
-                    hosts, parent_hosts.get(result.parent_domain, []), result.parent_domain
-                ):
+                ids = tenants_by_domain.get(result.domain) or tenant_identifiers(
+                    hosts, result.domain
+                )
+                on_group_tenant = bool(group_tenants & ids)
+                points_home = mail_points_at(hosts, result.parent_domain)
+                if on_group_tenant or points_home:
                     result.confidence = Confidence.HIGH.value
 
         mx_count = sum(1 for s in status_by_domain.values() if s == "mx")

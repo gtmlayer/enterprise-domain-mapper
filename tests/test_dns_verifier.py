@@ -184,36 +184,67 @@ class TestGuessedDomainsCannotReachHigh:
 # mail on GoDaddy and chaseuk.co.uk on IONOS, and neither belongs to Chase.
 
 
-class TestSharesMailWithParent:
-    def test_same_mail_tenant(self):
-        assert dv.shares_mail_with_parent(
-            ["cluster14a.us.messagelabs.com"], ["cluster14.us.messagelabs.com"], "jpmorgan.com"
+class TestTenantIdentifiers:
+    """A mail vendor is not a tenant. Only a customer id the provider assigned counts."""
+
+    def test_extracts_a_real_customer_id(self):
+        """HSBC's Proofpoint hostnames carry 00299f02, which is HSBC and nobody else."""
+        got = dv.tenant_identifiers(["mxa-00299f02.gslb.pphosted.com"], "hsbc.co.uk")
+        assert got == {"00299f02"}
+
+    def test_microsoft_365_yields_nothing(self):
+        """The regression. M365 names every tenant after its own domain, so two
+        unrelated companies look identical once the provider's domain is stripped."""
+        roper = dv.tenant_identifiers(
+            ["ropertech-com.mail.protection.outlook.com"], "ropertech.com"
         )
+        funeral_home = dv.tenant_identifiers(
+            ["roperandsons-com.mail.protection.outlook.com"], "roperandsons.com"
+        )
+        assert roper == set()
+        assert funeral_home == set()
+        assert not (roper & funeral_home)
 
-    def test_mx_pointing_straight_at_the_parent(self):
-        """jpmorganchase.de resolves to threshold2.jpmorgan.com."""
-        assert dv.shares_mail_with_parent(["threshold2.jpmorgan.com"], [], "jpmorgan.com")
+    def test_a_shared_cluster_number_yields_nothing(self):
+        """Symantec clusters are shared by many unrelated customers, and the suffix
+        varies: cluster14 and cluster14a are the same shared infrastructure."""
+        for host in ("cluster14.us.messagelabs.com", "cluster14a.us.messagelabs.com"):
+            assert dv.tenant_identifiers([host], "jpmorgan.com") == set(), host
 
-    def test_parked_domains_do_not_match(self):
-        for host in ("mailstore1.secureserver.net", "mx00.ionos.co.uk"):
-            assert not dv.shares_mail_with_parent(
-                [host], ["cluster14.us.messagelabs.com"], "jpmorgan.com"
-            )
+    def test_a_numbered_gateway_yields_nothing(self):
+        assert dv.tenant_identifiers(["gw3197.fortimail.com"], "roperind.net") == set()
 
-    def test_no_mail_does_not_match(self):
-        assert not dv.shares_mail_with_parent([], ["cluster14.us.messagelabs.com"], "jpmorgan.com")
+    def test_a_customer_id_survives_the_number_stripping(self):
+        """00299f02 must not be mistaken for a numbered generic host."""
+        assert dv.tenant_identifiers(["mxb-00299f02.gslb.pphosted.com"], "hsbc.fr") == {"00299f02"}
+
+    def test_generic_labels_are_ignored(self):
+        assert dv.tenant_identifiers(["mail.protection.outlook.com"], "example.com") == set()
+        assert dv.tenant_identifiers(["smtp.secureserver.net"], "chaseuk.com") == set()
+
+
+class TestMailPointsAt:
+    def test_mx_inside_the_target_domain(self):
+        """Nobody points their MX inside somebody else's domain."""
+        assert dv.mail_points_at(["threshold2.jpmorgan.com"], "jpmorgan.com")
+
+    def test_a_different_domain_does_not_count(self):
+        assert not dv.mail_points_at(["threshold2.jpmorgan.com"], "jpmorganchase.com")
+
+    def test_a_vendor_host_does_not_count(self):
+        assert not dv.mail_points_at(["mxa-00299f02.gslb.pphosted.com"], "hsbc.com")
 
 
 class TestCertPromotion:
-    """A certificate-observed domain reaches High only on the group's own mail."""
+    """A certificate-observed domain reaches High only on real ownership evidence."""
 
     @staticmethod
-    def _cert(domain):
+    def _cert(domain, parent="jpmorganchase.com"):
         from domain_mapper.models import DomainResult
 
         return DomainResult(
-            parent_company="JPMorgan Chase",
-            parent_domain="jpmorganchase.com",
+            parent_company="Test",
+            parent_domain=parent,
             subsidiary_name="(certificate log)",
             subsidiary_type="Observed domain",
             jurisdiction="",
@@ -222,51 +253,68 @@ class TestCertPromotion:
             confidence=Confidence.MEDIUM.value,
         )
 
-    def test_group_tenant_promotes_to_high(self, monkeypatch):
-        """Two observed domains agreeing on a tenant establish it as the group's."""
-        hosts = {
-            "jpmorganfunds.com": ["cluster14a.us.messagelabs.com"],
-            "jpmorganclimatecare.com": ["cluster14.us.messagelabs.com"],
-        }
+    @staticmethod
+    def _wire(monkeypatch, hosts):
         monkeypatch.setattr(dv, "_mx_hosts", lambda d: hosts.get(d, []))
         monkeypatch.setattr(dv, "_verify_single", lambda d: (d, "mx", hosts.get(d, [])))
 
-        out = dv.DnsVerifier().verify_domains([self._cert(d) for d in hosts])
+    def test_a_corroborated_customer_id_promotes(self, monkeypatch):
+        hosts = {
+            "hsbc.co.uk": ["mxb-00299f02.gslb.pphosted.com"],
+            "hsbc.fr": ["mxa-00299f02.gslb.pphosted.com"],
+        }
+        self._wire(monkeypatch, hosts)
+        out = dv.DnsVerifier().verify_domains([self._cert(d, "hsbc.com") for d in hosts])
         assert all(r.confidence == Confidence.HIGH.value for r in out)
 
-    def test_a_single_domain_cannot_define_the_group_tenant(self, monkeypatch):
-        """One squatter on its own mail must not become the reference."""
-        hosts = {"jpmorgan-not-really.com": ["mailstore1.secureserver.net"]}
-        monkeypatch.setattr(dv, "_mx_hosts", lambda d: hosts.get(d, []))
-        monkeypatch.setattr(dv, "_verify_single", lambda d: (d, "mx", hosts.get(d, [])))
+    def test_unrelated_microsoft_365_domains_are_not_a_group(self, monkeypatch):
+        """The Roper regression: a funeral home must not become a Roper domain."""
+        hosts = {
+            "roperwhitney.com": ["roperwhitney-com.mail.protection.outlook.com"],
+            "roperandsons.com": ["roperandsons-com.mail.protection.outlook.com"],
+            "roperandroper.com": ["roperandroper-com.mail.protection.outlook.com"],
+        }
+        self._wire(monkeypatch, hosts)
+        out = dv.DnsVerifier().verify_domains([self._cert(d, "ropertech.com") for d in hosts])
+        assert all(r.confidence == Confidence.MEDIUM.value for r in out), [
+            (r.domain, r.confidence) for r in out
+        ]
 
-        out = dv.DnsVerifier().verify_domains([self._cert("jpmorgan-not-really.com")])
+    def test_one_domain_cannot_corroborate_itself(self, monkeypatch):
+        hosts = {"only-one.com": ["mxa-abcd1234.gslb.pphosted.com"]}
+        self._wire(monkeypatch, hosts)
+        out = dv.DnsVerifier().verify_domains([self._cert("only-one.com")])
         assert out[0].confidence == Confidence.MEDIUM.value
+
+    def test_mx_inside_the_parent_domain_promotes_alone(self, monkeypatch):
+        hosts = {"jpmorganchase.de": ["threshold2.jpmorgan.com"]}
+        self._wire(monkeypatch, hosts)
+        out = dv.DnsVerifier().verify_domains([self._cert("jpmorganchase.de", "jpmorgan.com")])
+        assert out[0].confidence == Confidence.HIGH.value
 
     def test_a_guess_on_the_group_tenant_still_stays_medium(self, monkeypatch):
         """Deliberate boundary: guesses cap at Medium, which is a separate decision."""
         from domain_mapper.models import DomainResult
 
         hosts = {
-            "a.com": ["cluster14a.us.messagelabs.com"],
-            "b.com": ["cluster14.us.messagelabs.com"],
-            "guessed.com": ["cluster14.us.messagelabs.com"],
+            "a.com": ["mxa-00299f02.gslb.pphosted.com"],
+            "b.com": ["mxb-00299f02.gslb.pphosted.com"],
+            "guessed.com": ["mxa-00299f02.gslb.pphosted.com"],
         }
-        monkeypatch.setattr(dv, "_mx_hosts", lambda d: hosts.get(d, []))
-        monkeypatch.setattr(dv, "_verify_single", lambda d: (d, "mx", hosts.get(d, [])))
-
+        self._wire(monkeypatch, hosts)
         guess = DomainResult(
-            parent_company="JPMorgan Chase",
-            parent_domain="jpmorganchase.com",
-            subsidiary_name="Chase UK",
+            parent_company="Test",
+            parent_domain="hsbc.com",
+            subsidiary_name="Guessed",
             subsidiary_type="Subsidiary",
             jurisdiction="uk",
             domain="guessed.com",
             domain_source=DomainSource.TLD_GUESS.value,
             confidence=Confidence.MEDIUM.value,
         )
-        out = dv.DnsVerifier().verify_domains([self._cert("a.com"), self._cert("b.com"), guess])
+        out = dv.DnsVerifier().verify_domains(
+            [self._cert("a.com", "hsbc.com"), self._cert("b.com", "hsbc.com"), guess]
+        )
         by_domain = {r.domain: r.confidence for r in out}
-
         assert by_domain["a.com"] == Confidence.HIGH.value
         assert by_domain["guessed.com"] == Confidence.MEDIUM.value
